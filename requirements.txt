@@ -1,0 +1,37 @@
+# PAC Deployment Numerical — pinned dependencies.
+# Verified against the imports actually present in the source tree.
+
+# ── LLM providers ────────────────────────────────────────────────────────────
+# langchain-* are the interfaces used directly; openai/anthropic are the SDKs
+# underneath them and are pinned so a provider bump cannot move them silently.
+langchain==1.1.3
+langchain-core==1.2.13
+langchain-openai==1.1.3
+langchain-xai==1.1.0
+langchain-anthropic==1.3.3
+openai==2.11.0
+anthropic==0.79.0
+
+# ── Data / documents ─────────────────────────────────────────────────────────
+pydantic==2.12.5
+pandas==2.3.3
+pymupdf==1.26.7
+
+# ── MongoDB ──────────────────────────────────────────────────────────────────
+pymongo==4.16.0
+# Required by pymongo to resolve a mongodb+srv:// connection string, and
+# imported directly by scripts/check_mongo_srv.py and
+# scripts/build_standard_mongo_uri.py. The active URI in .env is a standard
+# mongodb:// one, but the SRV form is kept commented beside it — without this,
+# re-enabling it fails with a confusing "dnspython module must be installed".
+dnspython==2.8.0
+
+# ── App / runtime ────────────────────────────────────────────────────────────
+streamlit==1.52.1
+python-dotenv==1.2.1
+nest_asyncio==1.6.0
+
+# ── Not used by the grading pipeline ─────────────────────────────────────────
+# generate_bcp.py is a one-off .docx generator kept in the repo root; it is the
+# only thing that needs this.
+python-docx==1.2.0
