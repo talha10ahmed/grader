@@ -69,7 +69,7 @@ class PDFExtractor:
                     continue
                 page = doc[page_num - 1]
                 pix = page.get_pixmap(matrix=matrix, alpha=False)
-                image_bytes = pix.tobytes("jpeg", jpg_quality=90)
+                image_bytes = pix.tobytes("jpeg", jpg_quality=75)
                 encoded = base64.b64encode(image_bytes).decode("utf-8")
                 base64_images.append((page_num, encoded))
             return base64_images

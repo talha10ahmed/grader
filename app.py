@@ -5,8 +5,14 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'src'))
 
 import re
 import tempfile
+import time
 import traceback
 import streamlit as st
+from dotenv import load_dotenv
+
+# Load environment variables
+load_dotenv()
+load_dotenv(os.path.join(os.path.dirname(__file__), '..', '.env'))
 
 from main import grade_from_db
 from database.question_loader import list_available_questions
@@ -51,7 +57,8 @@ def _extract_question_number(title: str) -> str:
 
 def _save_file(uploaded_file, temp_dir: str) -> str:
     os.makedirs(temp_dir, exist_ok=True)
-    path = os.path.join(temp_dir, uploaded_file.name)
+    clean_name = re.sub(r'[^a-zA-Z0-9_.-]', '_', uploaded_file.name)
+    path = os.path.join(temp_dir, f"{int(time.time() * 1000)}_{clean_name}")
     with open(path, "wb") as f:
         f.write(uploaded_file.getbuffer())
     return path
@@ -83,23 +90,21 @@ def main():
         st.warning("No questions found in the database. Use the extraction tool to add questions first.")
         st.stop()
 
-    # ── Question selector ────────────────────────────────────────────────────
-    st.header("Select Question")
-    labels = [f"{q['question_title']}  ({q['total_marks']} marks)" for q in questions]
-    idx = st.selectbox("Question", range(len(labels)), format_func=lambda i: labels[i])
-    selected = questions[idx]
-
-    if selected.get("description"):
-        with st.expander("Question description"):
-            st.write(selected["description"])
-
+    # ── PDF selector ─────────────────────────────────────────────────────────
+    st.header("Select PDF")
+    st.selectbox(
+        "PDF",
+        options=["ACR_Mock_Summer_2026_Suggested_Answers.pdf"],
+        index=0,
+        help="ACR Suggested Answers PDF auto-inserted."
+    )
     st.markdown("---")
 
     # ── Student upload + config ──────────────────────────────────────────────
     st.header("Student Assignment")
     student_pdf = st.file_uploader("Upload Student PDF", type="pdf")
 
-    default_qnum = _extract_question_number(selected["question_title"])
+    default_qnum = "1"
 
     col1, col2 = st.columns(2)
     with col1:
@@ -129,6 +134,16 @@ def main():
             ),
         ) or "numerical"
 
+    force_regrade = st.checkbox(
+        "Grade again (ignore any saved result)",
+        value=False,
+        help=(
+            "A script that was graded before gets its saved result back, so the "
+            "same file always receives the same marks. Tick this only to grade "
+            "it afresh, e.g. when testing."
+        ),
+    )
+
     # ── Grade ────────────────────────────────────────────────────────────────
     if st.button("Grade Student", type="primary"):
         if not student_pdf:
@@ -145,6 +160,12 @@ def main():
             st.error("Please enter the question number the student is answering.")
             st.stop()
 
+        clean_match = re.search(r'(\d+)', question_num)
+        target_num = clean_match.group(1) if clean_match else question_num
+        selected = next(
+            (q for q in questions if _extract_question_number(q.get("question_title", "")) == target_num),
+            questions[0]
+        )
         model_answers_id = selected["_id"]
 
         os.makedirs(output_dir, exist_ok=True)
@@ -165,8 +186,11 @@ def main():
                 output_dir=output_dir,
                 question_num=question_num,
                 question_type=question_type,
+                force_regrade=force_regrade,
             )
             progress.progress(100)
+
+
 
             # Read the PDF bytes now and stash everything in session_state.
             # Rendering the download buttons from session_state (outside this

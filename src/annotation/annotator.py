@@ -467,6 +467,11 @@ def _narrow_rect_to_target_variants(
             if hit.y0 >= y_min and hit.y1 <= y_max:
                 in_range_hits.append(hit)
         if not in_range_hits:
+            # Fallback for multi-line table cells (e.g. label on line 1, value on line 2):
+            for hit in hits or []:
+                if hit.y0 >= float(rect.y0) - 16 and hit.y1 <= float(rect.y1) + 16:
+                    in_range_hits.append(hit)
+        if not in_range_hits:
             continue
         # Column-header disambiguation. Preferred rule: pick the value hit
         # whose LEFT edge sits AT OR TO THE RIGHT OF the header's left edge,
@@ -586,8 +591,13 @@ def _find_evidence_strict(
     page_token_sets: Optional[dict] = None,
     min_y_per_page: Optional[dict] = None,
     max_y_per_page: Optional[dict] = None,
+    allow_headings: bool = False,
 ) -> Tuple[List["fitz.Rect"], int, bool]:
     """Numerical-mode evidence resolver.
+
+    `allow_headings` lets the evidence resolve to a heading line. Only the
+    presentation mark wants that: the examiner writes "MP" beside the
+    statement's title, while every other mark belongs on a working line.
 
     Returns (list_of_rects, page_num, is_wrapped) where *is_wrapped* is
     True only when Tier 1 resolved the evidence to a single occurrence
@@ -660,7 +670,7 @@ def _find_evidence_strict(
                 if _outside(page_num, anchor):
                     continue
                 line_text = _line_text_at(page, anchor)
-                if line_text and _is_heading_like(line_text):
+                if line_text and _is_heading_like(line_text) and not allow_headings:
                     continue
                 return list(group), page_num, len(group) > 1
 
@@ -687,7 +697,7 @@ def _find_evidence_strict(
             for line_text, line_rect in _iter_page_lines(page):
                 if _outside(page_num, line_rect):
                     continue
-                if _is_heading_like(line_text):
+                if _is_heading_like(line_text) and not allow_headings:
                     continue
                 if ev_norm in _norm(line_text):
                     # Try to narrow the whole-line rect to just the most
@@ -1226,11 +1236,25 @@ def annotate_pdf(
             'allowed_pages': allowed_pages,
         }
 
-        # ── Total score label ──────────────────────────────────────────────────
-        main_score_text = (
-            f"{_fmt_mark_value(grades_doc['total_marks_awarded'])}/"
-            f"{_fmt_mark_value(grades_doc['total_max_possible'])}"
-        )
+        # ── Total score label (format matching examiner: Q.1a = 3 + Q.1b = 16.5 Total = 19.5/22) ──
+        breakdown = grades_doc.get('breakdown', [])
+        parts_scores: dict[str, float] = {}
+        for b in breakdown:
+            cid = str(b.get('criterion_id') or b.get('id') or '')
+            m = re.match(r'Q?(\d+)([A-Za-z])', cid)
+            if m:
+                p_label = f"Q.{m.group(1)}{m.group(2).lower()}"
+                parts_scores[p_label] = parts_scores.get(p_label, 0.0) + float(b.get('marks_awarded', 0) or 0.0)
+
+        total_awarded_str = _fmt_mark_value(grades_doc['total_marks_awarded'])
+        total_max_str = _fmt_mark_value(grades_doc['total_max_possible'])
+
+        if len(parts_scores) > 1:
+            parts_expr = " + ".join(f"{p} = {_fmt_mark_value(score)}" for p, score in sorted(parts_scores.items()))
+            main_score_text = f"{parts_expr} Total = {total_awarded_str}/{total_max_str}"
+        else:
+            main_score_text = f"{total_awarded_str}/{total_max_str}"
+
         if add_main_score(
             doc, str(grades_doc.get('question_number', '')),
             main_score_text, allowed_pages,
@@ -1241,13 +1265,33 @@ def annotate_pdf(
         # ── Per-criterion annotation ───────────────────────────────────────────
         breakdown = grades_doc.get('breakdown', [])
         is_holistic = grades_doc.get('holistic_grading', False)
+
+        def _is_legitimate_note_item(it: dict) -> bool:
+            _r = str(it.get('reason', '') or '')
+            if "Marks given above" not in _r and "Marks given below" not in _r:
+                return False
+            _ev = it.get('evidence', '') or ''
+            if isinstance(_ev, list):
+                _ev = ' '.join(str(e) for e in _ev)
+            _ev = str(_ev).strip()
+            if len(_ev) < 8:
+                return False
+            if re.fullmatch(r"[\s\d,.\-()+/%\$£€*#@!_:]+", _ev):
+                return False
+            words = re.findall(r"[a-zA-Z]{3,}", _ev)
+            if len(words) < 2:
+                return False
+            if re.search(r"\b(for|of|and|the|to|in|by|with|at|from)\s*$", _ev, re.I):
+                return False
+            return True
+
         displayed_breakdown = [
             it for it in breakdown
             if float(it.get('marks_awarded', 0) or 0) > 0
-            or "Marks given above" in str(it.get('reason', '') or '')
-            or "Marks given below" in str(it.get('reason', '') or '')
+            or _is_legitimate_note_item(it)
         ]
         annotation_mapping['total_criteria'] = len(displayed_breakdown)
+
         criteria_count = 0
 
         def _is_informative_anchor(text: str) -> bool:
@@ -1683,15 +1727,23 @@ def annotate_pdf(
                 # reason, but the LLM's newer outputs put OF mid-sentence
                 # (e.g., "Cr Net assets (OF 18,800) and Cr Goodwill 11,725
                 # both present.").
-                is_of = item.get('is_of_mark', False) or bool(
-                    re.search(r'\bOF\b', _item_reason)
-                )
+                # `mark_tag` is decided by the grader from the final marks
+                # ("OF", "MP" or ""). Documents graded before it existed fall
+                # back to reading "OF" out of the reason.
+                if 'mark_tag' in item:
+                    mark_tag = str(item.get('mark_tag') or '')
+                else:
+                    is_of = item.get('is_of_mark', False) or bool(
+                        re.search(r'\bOF\b', _item_reason)
+                    )
+                    mark_tag = "OF" if is_of else ""
                 if marks == 0 and "Marks given above" in _item_reason:
-                    score_label = "Marks given above"
+                    score_label = "Marks given above" if _is_legitimate_note_item(item) else ""
                 elif marks == 0 and "Marks given below" in _item_reason:
-                    score_label = "Marks given below"
-                elif is_of:
-                    score_label = f"OF {_fmt_mark_value(marks)}"
+                    score_label = "Marks given below" if _is_legitimate_note_item(item) else ""
+
+                elif mark_tag:
+                    score_label = f"{_fmt_mark_value(marks)} {mark_tag}"
                 else:
                     score_label = _fmt_mark_value(marks)
 
@@ -1754,6 +1806,7 @@ def annotate_pdf(
                         page_token_sets=page_token_sets,
                         min_y_per_page=min_y_per_page,
                         max_y_per_page=max_y_per_page,
+                        allow_headings=(mark_tag == "MP"),
                     )
                     if not (rects and page_num > 0):
                         return False
@@ -2085,8 +2138,9 @@ def annotate_pdf(
         doc.close()
 
         annotation_mapping['unplaced_items'] = unplaced_items[:10]
-        with open(mapping_json, 'w') as f:
-            json.dump(annotation_mapping, f, indent=2, default=str)
+        if os.getenv("DEBUG_SAVE_ANNOTATION_MAPPING", "").strip().lower() in {"1", "true", "yes"}:
+            with open(mapping_json, 'w') as f:
+                json.dump(annotation_mapping, f, indent=2, default=str)
 
         success_rate = (
             annotation_mapping['criterion_scores_placed']
@@ -2098,3 +2152,9 @@ def annotate_pdf(
     except Exception as e:
         logger.error(f"Annotation failed for {student_name}: {e}", exc_info=True)
         return False, ""
+    finally:
+        if 'doc' in locals() and doc is not None:
+            try:
+                doc.close()
+            except Exception:
+                pass

@@ -30,6 +30,14 @@ class GradeBreakdownItem(BaseModel):
         )
     )
     comments_summary: Optional[str] = Field(None, description="Grader comment for this specific item (if any)")
+    mark_tag: Optional[str] = Field(
+        default=None,
+        description=(
+            "Label printed beside the mark on the script: 'OF' (own figure - the "
+            "student's different figure still earned the mark), 'MP' (presentation "
+            "mark) or '' for a plain mark. Absent on documents graded before tags existed."
+        )
+    )
     criterion_focus: Optional[str] = Field(
         default=None,
         description=(
