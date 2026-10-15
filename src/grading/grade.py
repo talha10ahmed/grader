@@ -2,8 +2,10 @@ import json
 import re
 import os
 import ast
+import copy
 import math
 import traceback
+from collections import Counter
 from datetime import datetime
 from typing import Optional, Any, Tuple
 from bson import ObjectId
@@ -31,6 +33,7 @@ class CorrectPoint(BaseModel):
 
 
 class LLMGradingBreakdownItem(BaseModel):
+    criterion_id: Optional[str] = Field(None, description="The criterion ID from the rubric, e.g. Q1A01, Q1B01a, Q2A01. REQUIRED.")
     criterion: str = Field(..., description="Exact criterion description from model marking_criteria")
     marks_awarded: float = Field(..., ge=0, description="Marks awarded for this criterion")
     max_possible: float = Field(..., ge=0, description="Maximum marks possible for this criterion")
@@ -319,6 +322,74 @@ def _reject_contradictory_awards(normalized_breakdown: list[dict]) -> float:
     return revoked
 
 
+def _verify_elimination_and_numeric_criteria(
+    normalized_breakdown: list[dict],
+    expected_amount_map: dict[str, float],
+    criterion_id_by_desc: dict,
+    of_ids_map: dict,
+    of_source_ids_map: dict,
+) -> float:
+    """Revoke marks where a non-OF criterion requires a specific numeric amount,
+    such as intra-group balance elimination, but the student's evidence quotes
+    an explicitly incorrect number and does not contain the required figure.
+    """
+    revoked = 0.0
+    for bd in normalized_breakdown:
+        try:
+            awarded = float(bd.get("marks_awarded", 0) or 0)
+        except (TypeError, ValueError):
+            continue
+        if awarded <= 0:
+            continue
+        crit = str(bd.get("criterion", "") or "")
+        cid = criterion_id_by_desc.get(crit, "")
+        expected = expected_amount_map.get(crit)
+        if expected is None:
+            continue
+        # Own-figure criteria allow student's own upstream figures
+        if crit in of_ids_map or crit in of_source_ids_map:
+            continue
+
+        mag = abs(float(expected))
+        if mag <= 0:
+            continue
+
+        # Target elimination criteria (an intra-group balance cancelled out)
+        crit_lower = crit.lower()
+        is_elimination = (
+            "eliminated" in crit_lower
+            or "intra-group" in crit_lower
+            or "intragroup" in crit_lower
+            or "intercompany" in crit_lower
+        )
+        if not is_elimination:
+            continue
+
+        ev_items = bd.get("evidence_list") or []
+        ev_blob = " ".join(str(e) for e in ev_items if e)
+        ev_clean = ev_blob.replace(",", "").replace(" ", "")
+
+        mag_int = int(round(mag))
+        has_expected = (
+            str(mag_int) in ev_clean
+            or f"{mag_int:,}" in ev_blob
+            or f"{mag/1000:g}k" in ev_blob.lower()
+            or f"{mag/1000:g}" in ev_blob
+        )
+
+        if not has_expected:
+            bd["marks_awarded"] = 0.0
+            revoked += awarded
+            prev = (bd.get("reason", "") or "").strip()
+            bd["reason"] = (
+                f"Marks revoked (incorrect elimination amount): criterion requires "
+                f"eliminating {mag_int:,}, but student's evidence does not show this figure. "
+                + prev
+            ).strip()
+
+    return revoked
+
+
 # Currency / spacing that may sit between a sign marker and the digits.
 _SIGN_PREFIX_CHARS = " \t£$€"
 
@@ -582,7 +653,7 @@ def _criterion_group_key(
     than guessing at it.
     """
     cid = str(criterion_id_by_desc.get(criterion, "") or "")
-    m = re.match(r"^([A-Za-z]+)", cid)
+    m = re.match(r"^(Q\d+[A-Za-z]|[A-Za-z]+\d+[A-Za-z]|[A-Za-z]+)", cid, re.IGNORECASE)
     if m:
         return m.group(1).upper()
     for src in (of_component_of_map, of_ids_map, of_source_ids_map):
@@ -630,9 +701,11 @@ def _apply_section_locality_guard(
 
     Returns total marks revoked.
     """
-    sections = _split_student_sections(student_text)
-    if not sections:
-        return 0.0
+    # Accounting exam scripts routinely cross-reference workings across sub-parts
+    # (e.g. W1 Goodwill, W2 Retained Earnings, W5 Gain on disposal) and place
+    # workings on later pages. Section locality checks across sub-parts of the
+    # same question incorrectly revoke legitimate workings.
+    return 0.0
 
     located: list[tuple[int, str, int]] = []
     for i, bd in enumerate(normalized_breakdown):
@@ -1057,6 +1130,455 @@ def _computed_values_in_text(text: str) -> set[int]:
                         found.add(int(round(scaled)))
             break
     return found
+
+
+# ── Working-level arithmetic ──────────────────────────────────────────────────
+# Students write "426,900 x 20%" or "12,000 × 9/12", which the evaluator above
+# cannot read. These helpers rewrite that notation, split a line into the
+# expressions and bare figures it holds, and find where the student's own
+# arithmetic went wrong - so a mark can be judged on what the student actually
+# wrote rather than on whether a number happens to match the model answer.
+
+_PERCENT_RE = re.compile(r"(\d[\d,]*(?:\.\d+)?)\s*%")
+_TIMES_BETWEEN_RE = re.compile(r"(?<=[\d)])\s*[x×X]\s*(?=[\d(])")
+# Two operands separated only by whitespace ("...)*3 80,560.00") are two
+# different things on one line: the working and its result.
+_OPERAND_GAP_RE = re.compile(r"(?<=[\d)])\s+(?=[\d(])")
+_ARITH_SEGMENT_RE = re.compile(r"[(\d][\d,.()*/+\-\s]*")
+_BARE_NUMBER_RE = re.compile(r"^\(?\s*-?\s*\d[\d,]*(?:\.\d+)?\s*\)?$")
+_NUMBER_TOKEN_RE = re.compile(r"(?<![\d.,])\d{1,3}(?:,\d{3})+(?:\.\d+)?|(?<![\d.,])\d+(?:\.\d+)?")
+
+# A line that opens a new working or statement. Used to tell "the working where
+# the student made the error" apart from later workings that only carry the
+# figure forward.
+_WORKING_HEADING_RE = re.compile(
+    r"""^\s*(?:
+        -{3}\s.+\s-{3}\s*$                   # section header from the prompt formatter
+      | \(?\s*w\s*[-.]?\s*\d+(?:\.\d+)?\)?\s*[-:.]?\s*[a-z]   # "W1 Goodwill", "(W2) Investment"; a bare "W-1" is a reference
+      | \(\s*\d{1,2}\s*\)\s*[a-z]            # (1) Goodwill
+      | workings?\b
+      | part\s*\(?[a-z0-9]{1,2}\)?(?:\s|$|[-:])
+      | q(?:uestion|usetion|usewtion)?\.?\s*(?:no\.?\s*)?\d
+      | .*\bstatement\s+of\b
+      | .*\bprofit\s+(?:or|and)\s+loss\b
+    )""",
+    re.IGNORECASE | re.VERBOSE,
+)
+
+
+def _normalize_arith_text(text: str) -> str:
+    """Rewrite student multiplication / percent notation into plain operators:
+    "426,900 x 20%" -> "426,900 * (20/100)"."""
+    if not text:
+        return ""
+    t = text.replace("×", "x")
+    t = _PERCENT_RE.sub(lambda m: f"({m.group(1)}/100)", t)
+    t = _TIMES_BETWEEN_RE.sub(" * ", t)
+    return t
+
+
+def _parse_number(token: str) -> Optional[float]:
+    t = token.strip().replace(",", "")
+    neg = t.startswith("(") and t.endswith(")")
+    t = t.strip("()").strip()
+    try:
+        v = float(t)
+    except ValueError:
+        return None
+    return -v if neg else v
+
+
+def _balance_parens(expr: str) -> str:
+    expr = expr.strip()
+    while expr.count(")") > expr.count("(") and expr.endswith(")"):
+        expr = expr[:-1].rstrip()
+    while expr.count("(") > expr.count(")") and expr.startswith("("):
+        expr = expr[1:].lstrip()
+    return expr
+
+
+def _eval_expression(expr: str) -> Optional[float]:
+    """Value of one arithmetic expression, or None when it is not one."""
+    expr = _balance_parens(expr.replace(",", ""))
+    expr = re.sub(r"[+\-*/]\s*$", "", expr).strip()
+    if not expr or not re.search(r"\d\s*[+\-*/]\s*[\d(]", expr):
+        return None
+    try:
+        tree = ast.parse(expr, mode="eval")
+    except (SyntaxError, ValueError, MemoryError, RecursionError):
+        return None
+    val = _eval_arith_node(tree)
+    if val is None or not math.isfinite(val):
+        return None
+    return val
+
+
+def _line_segments(line: str) -> list[tuple[str, Optional[float], Optional[float]]]:
+    """Split one line into (raw, expression_value, bare_number) segments, in
+    the order the student wrote them. Exactly one of the two values is set."""
+    out: list[tuple[str, Optional[float], Optional[float]]] = []
+    norm = _normalize_arith_text(line)
+    for m in _ARITH_SEGMENT_RE.finditer(norm):
+        for part in _OPERAND_GAP_RE.split(m.group(0)):
+            part = part.strip()
+            if not part or not re.search(r"\d", part):
+                continue
+            if _BARE_NUMBER_RE.match(part):
+                out.append((part, None, _parse_number(part)))
+                continue
+            val = _eval_expression(part)
+            if val is not None:
+                out.append((part, val, None))
+    return out
+
+
+def _numbers_in_text(text: str) -> list[float]:
+    vals = []
+    for tok in _NUMBER_TOKEN_RE.findall(text or ""):
+        v = _parse_number(tok)
+        if v is not None:
+            vals.append(abs(v))
+    return vals
+
+
+def _working_block_ids(lines: list[str]) -> list[int]:
+    """Block number for every line; a working heading starts a new block."""
+    ids: list[int] = []
+    block = 0
+    for line in lines:
+        if line.strip() and _WORKING_HEADING_RE.match(line):
+            block += 1
+        ids.append(block)
+    return ids
+
+
+def _detect_arithmetic_slips(student_text: str) -> list[dict]:
+    """Lines where the student wrote a calculation and then a result that the
+    calculation does not produce, e.g. "426,900 x 20%" followed by 85,360.
+
+    Only small differences count (rounding aside): a large gap means the line
+    was misread rather than miscalculated, and the rule built on this must
+    never fire on a misreading.
+    """
+    if not student_text:
+        return []
+    lines = student_text.split("\n")
+    blocks = _working_block_ids(lines)
+    slips: list[dict] = []
+    for i, line in enumerate(lines):
+        segs = _line_segments(line)
+        for k, (raw, val, _bare) in enumerate(segs):
+            if val is None:
+                continue
+            result = None
+            result_line = i
+            if k + 1 < len(segs) and segs[k + 1][2] is not None:
+                result = segs[k + 1][2]
+            elif k == len(segs) - 1:
+                for j in range(i + 1, min(i + 4, len(lines))):
+                    nxt = lines[j].strip()
+                    if not nxt:
+                        continue
+                    if _BARE_NUMBER_RE.match(nxt):
+                        result = _parse_number(nxt)
+                        result_line = j
+                    break
+            if result is None:
+                continue
+            v, r = abs(val), abs(result)
+            diff = abs(v - r)
+            if v <= 0 or diff <= 0.5 or diff > 0.02 * v:
+                continue
+            shown = re.sub(r"\((\d[\d,.]*)/100\)", r"\1%", _balance_parens(raw))
+            shown = re.sub(r"\s*\*\s*", " x ", shown).strip()
+            if shown.startswith("(") and shown.endswith(")") and shown.count("(") == 1:
+                shown = shown[1:-1].strip()
+            slips.append({
+                "line": i,
+                "result_line": result_line,
+                "block": blocks[i],
+                "expression": shown,
+                "correct": v,
+                "written": r,
+            })
+    return slips
+
+
+def _norm_line(s: str) -> str:
+    s = (s or "").replace(" ", " ").replace("×", "x").lower()
+    return re.sub(r"\s+", " ", s).strip()
+
+
+def _evidence_window(evidence_list: list, student_text: str) -> tuple[str, list[int]]:
+    """The student's lines a piece of evidence points at, plus the figure lines
+    directly under them.
+
+    Extracted scripts usually put a row's label and its amount on separate
+    lines ("Ordinary Share Capital" / "800,000.00"), and the grading model
+    often quotes only one of them, so the amount has to be read from the lines
+    that follow.
+    """
+    lines = (student_text or "").split("\n")
+    norm_lines = [_norm_line(l) for l in lines]
+    idxs: list[int] = []
+    parts: list[str] = []
+    for ev in evidence_list or []:
+        for part in re.split(r"[\n;]+", str(ev or "")):
+            p = _norm_line(part)
+            if len(p) >= 4:
+                parts.append(p)
+    for p in parts:
+        # A bare figure says nothing about WHERE it was written - the same
+        # amount usually appears in several workings - so only lines with
+        # words are used to locate the evidence. The figure itself stays in
+        # the window through `parts`.
+        if not re.search(r"[a-z]", p):
+            continue
+        hit = None
+        for i, nl in enumerate(norm_lines):
+            if len(nl) >= 4 and p in nl:
+                hit = i
+                break
+        if hit is None:
+            for i, nl in enumerate(norm_lines):
+                if len(nl) >= 6 and re.search(r"[a-z]", nl) and nl in p:
+                    hit = i
+                    break
+        if hit is not None and hit not in idxs:
+            idxs.append(hit)
+    window_lines: list[str] = list(parts)
+    for i in sorted(idxs):
+        window_lines.append(lines[i])
+        taken = 0
+        for j in range(i + 1, min(i + 6, len(lines))):
+            nxt = lines[j].strip()
+            if not nxt:
+                continue
+            if not _BARE_NUMBER_RE.match(nxt) or taken >= 2:
+                break
+            window_lines.append(nxt)
+            taken += 1
+    return "\n".join(window_lines), sorted(idxs)
+
+
+def _value_shown(expected: float, text: str) -> bool:
+    """True when the student's text shows `expected`: written out, produced by
+    one of their calculations, or shown as two figures that net to it
+    (gross goodwill 22,500 and impairment 5,200 for 17,300)."""
+    target = abs(float(expected))
+    if target <= 0 or not text:
+        return False
+    if _value_present_in_text(int(round(target)), text):
+        return True
+    for line in text.split("\n"):
+        for _raw, val, _bare in _line_segments(line):
+            if val is None:
+                continue
+            for scaled in (abs(val), abs(val) / 1000.0):
+                if abs(scaled - target) <= 0.5:
+                    return True
+    nums = sorted({n for n in _numbers_in_text(text) if n >= 1})
+    for a_i, a in enumerate(nums):
+        for b in nums[a_i + 1:]:
+            if abs((b - a) - target) <= 0.5 or abs((a + b) - target) <= 0.5:
+                return True
+    return False
+
+
+def _near_miss(value: float, expected: float) -> bool:
+    """A figure that is the expected one mis-copied: the same digits in a
+    different order, or within 2% of it."""
+    v, e = abs(value), abs(expected)
+    if v <= 0 or e <= 0 or abs(v - e) <= 0.5:
+        return False
+    dv = re.sub(r"\D", "", f"{v:.2f}".rstrip("0").rstrip("."))
+    de = re.sub(r"\D", "", f"{e:.2f}".rstrip("0").rstrip("."))
+    if len(dv) == len(de) and sorted(dv) == sorted(de):
+        return True
+    return abs(v - e) <= 0.02 * e
+
+
+def _apply_given_figure_check(
+    normalized_breakdown: list[dict],
+    expected_amount_map: dict,
+    of_source_ids_map: dict,
+    student_text: str,
+) -> float:
+    """Withhold a mark when the student wrote a different figure from the one
+    the criterion requires and the criterion does not allow own figures.
+
+    A figure the question gives (retained earnings 83,560) has to be copied
+    correctly; a student who writes 83,650 has not shown 83,560, whatever the
+    surrounding working looks like. Own-figure criteria are skipped - their
+    figure is allowed to differ.
+
+    Fires only when the student's line holds a mis-copied version of the
+    figure, or the figure is nowhere in that working. When the evidence carries
+    no figure at all the grading model's judgement stands.
+
+    Returns marks revoked.
+    """
+    if not student_text:
+        return 0.0
+    lines = student_text.split("\n")
+    blocks = _working_block_ids(lines)
+    revoked = 0.0
+    for bd in normalized_breakdown:
+        try:
+            awarded = float(bd.get("marks_awarded", 0) or 0)
+        except (TypeError, ValueError):
+            continue
+        if awarded <= 0:
+            continue
+        crit = str(bd.get("criterion", "") or "")
+        expected = expected_amount_map.get(crit)
+        if expected is None or abs(float(expected)) < 1:
+            continue
+        if of_source_ids_map.get(crit):
+            continue
+        ev_items = bd.get("evidence_list") or ([bd.get("evidence")] if bd.get("evidence") else [])
+        window, idxs = _evidence_window(ev_items, student_text)
+        nums = [n for n in _numbers_in_text(window) if n >= 100]
+        if not nums or _value_shown(expected, window):
+            continue
+        misses = [n for n in nums if _near_miss(n, expected)]
+        if not misses:
+            in_block = False
+            for i in idxs:
+                block_text = "\n".join(
+                    l for l, b in zip(lines, blocks) if b == blocks[i]
+                )
+                if _value_shown(expected, block_text):
+                    in_block = True
+                    break
+            if in_block or not idxs:
+                continue
+        exp_abs = abs(float(expected))
+        written = misses[0] if misses else None
+        bd["marks_awarded"] = 0.0
+        revoked += awarded
+        if written is not None:
+            bd["reason"] = (
+                f"Not awarded: the student used {written:,.0f} where the correct "
+                f"figure is {exp_abs:,.0f}."
+            )
+        else:
+            bd["reason"] = (
+                f"Not awarded: the required figure {exp_abs:,.0f} is not shown in "
+                f"the student's working."
+            )
+        bd["_given_figure_error"] = {"expected": exp_abs, "written": written}
+    return revoked
+
+
+def _apply_arithmetic_slip_rule(
+    normalized_breakdown: list[dict],
+    expected_amount_map: dict,
+    of_source_ids_map: dict,
+    student_text: str,
+) -> float:
+    """Examiner rule for a calculation error inside a working.
+
+    When a student sets up a calculation correctly but gets the arithmetic
+    wrong (426,900 x 20% written as 85,360), the examiner:
+      • awards the marks for the correct inputs (the grading model does this),
+      • withholds the mark for the RESULT of that working (goodwill 18,460),
+        even though it is the correct sum of the student's own figures,
+      • awards own-figure marks where a LATER working carries the wrong figure
+        forward (NCI working starting from 85,360).
+
+    So an own-figure award is withheld only when the student's figure was
+    produced inside the working where the slip happened.
+
+    Returns marks revoked.
+    """
+    slips = _detect_arithmetic_slips(student_text)
+    if not slips:
+        return 0.0
+    lines = student_text.split("\n")
+    blocks = _working_block_ids(lines)
+
+    # Figures the student derived inside each slipped working, after the slip.
+    derived_after: list[set[int]] = []
+    for s in slips:
+        vals: set[int] = set()
+        for j in range(s["result_line"] + 1, len(lines)):
+            if blocks[j] != s["block"]:
+                break
+            for n in _numbers_in_text(lines[j]):
+                vals.add(int(round(n)))
+        derived_after.append(vals)
+
+    revoked = 0.0
+    for bd in normalized_breakdown:
+        try:
+            awarded = float(bd.get("marks_awarded", 0) or 0)
+        except (TypeError, ValueError):
+            continue
+        if awarded <= 0:
+            continue
+        crit = str(bd.get("criterion", "") or "")
+        expected = expected_amount_map.get(crit)
+        if expected is None or not of_source_ids_map.get(crit):
+            continue
+        ev_items = bd.get("evidence_list") or ([bd.get("evidence")] if bd.get("evidence") else [])
+        window, idxs = _evidence_window(ev_items, student_text)
+        if _value_shown(expected, window):
+            continue  # correct figure - nothing to judge
+        own = {int(round(n)) for n in _numbers_in_text(window) if n >= 100}
+        if not own:
+            continue
+        ev_blocks = {blocks[i] for i in idxs}
+        for s, after in zip(slips, derived_after):
+            hit = own & after
+            written = int(round(s["written"]))
+            if not hit and written in own and s["block"] in ev_blocks:
+                hit = {written}
+            if not hit:
+                continue
+            own_fig = sorted(hit)[0]
+            bd["marks_awarded"] = 0.0
+            revoked += awarded
+            bd["reason"] = (
+                f"Not awarded: {own_fig:,} comes from the working where "
+                f"{s['expression'].strip()} was calculated as {s['written']:,.0f} "
+                f"instead of {s['correct']:,.0f}. The correct figure is "
+                f"{abs(float(expected)):,.0f}."
+            )
+            bd["_arithmetic_slip"] = {
+                "expression": s["expression"].strip(),
+                "written": s["written"],
+                "correct": s["correct"],
+            }
+            break
+    return revoked
+
+
+def _multiline_evidence_present(evidence: str, student_blob_norm: str, normalize) -> bool:
+    """True when evidence quoted across several lines is in the student's
+    answer line by line.
+
+    The grading model quotes a working and its result together
+    ("29500*20%\\n(5,900.00)"), but the extracted script often has other
+    cells between them, so the joined quote is never a substring of the
+    answer and a correct mark was being revoked as "evidence not found".
+    Every quoted line must still be found verbatim, and at least one must be
+    distinctive, so a fabricated quote cannot pass.
+    """
+    if not evidence or "\n" not in evidence or not student_blob_norm:
+        return False
+    parts = [normalize(p) for p in evidence.split("\n")]
+    parts = [p for p in parts if p]
+    if len(parts) < 2:
+        return False
+    distinctive = False
+    for p in parts:
+        if p not in student_blob_norm:
+            return False
+        compact = p.replace(" ", "")
+        if (re.search(r"\d", p) and len(compact) >= 4) or len(compact) >= 12:
+            distinctive = True
+    return distinctive
 
 
 # Journal-line prefix: matches lines the student wrote as journal entries
@@ -2138,7 +2660,36 @@ def _norm_for_evidence_match_static(s: str) -> str:
     return re.sub(r"\s+", " ", s).strip()
 
 
+def _is_legitimate_restatement_line(line: str) -> bool:
+    """Return True only if line is a descriptive narrative statement/heading.
+
+    Rejects:
+      - Bare numbers / financial statement cells (e.g. '1,642,520.00', '800,000')
+      - Pure punctuation or symbols (e.g. '-', '--', '(5,200.00)')
+      - Strings shorter than 8 characters
+      - Lines without at least two real alphabetic words
+      - Incomplete fragments ending in prepositions / conjunctions
+    """
+    if not line or not isinstance(line, str):
+        return False
+    s = line.strip()
+    if len(s) < 8:
+        return False
+    # Pure numbers, currencies, arithmetic, punctuation
+    if re.fullmatch(r"[\s\d,.\-()+/%\$£€*#@!_:]+", s):
+        return False
+    # Must contain at least two real alphabetic words (3+ chars each)
+    words = re.findall(r"[a-zA-Z]{3,}", s)
+    if len(words) < 2:
+        return False
+    # Incomplete fragments ending in prepositions/conjunctions
+    if re.search(r"\b(for|of|and|the|to|in|by|with|at|from)\s*$", s, re.I):
+        return False
+    return True
+
+
 class StudentGrader:
+
 
     COLLECTION_NAME = "student_grades"
 
@@ -2830,12 +3381,19 @@ class StudentGrader:
                     _entry["category"] = it["category"]
                 if it.get("exact_match"):
                     _entry["exact_match"] = it["exact_match"]
-                # Preserve OF metadata through dedup.
+                # Preserve OF metadata and rubric fields through dedup.
                 for _fld in (
                     "criterion_id",
                     "of_ids", "of_id", "of_source_ids", "of_component_of",
                     "of_produces",
                     "of_value", "of_value_unit", "of_value_label",
+                    "expected_amount",
+                    "sign_sensitive",
+                    "keywords",
+                    "formula",
+                    "column",
+                    "of_tag",
+                    "examiner_guidance",
                 ):
                     if _fld in it and it.get(_fld) is not None:
                         _entry[_fld] = it[_fld]
@@ -3254,10 +3812,17 @@ class StudentGrader:
                             "description": combined_desc,
                         }
                         for _fld in (
-                            "criterion_id",
+                            "criterion_id", "category",
                             "of_ids", "of_id", "of_source_ids",
                             "of_value", "of_value_unit", "of_value_label",
                             "exact_match",
+                            "expected_amount",
+                            "sign_sensitive",
+                            "keywords",
+                            "formula",
+                            "column",
+                            "of_tag",
+                            "examiner_guidance",
                         ):
                             if _fld in sub and sub.get(_fld) is not None:
                                 _sub_entry[_fld] = sub[_fld]
@@ -3289,6 +3854,13 @@ class StudentGrader:
                                 "of_ids", "of_id", "of_source_ids",
                                 "of_component_of", "of_produces",
                                 "of_value", "of_value_unit", "of_value_label",
+                                "expected_amount",
+                                "sign_sensitive",
+                                "keywords",
+                                "formula",
+                                "column",
+                                "of_tag",
+                                "examiner_guidance",
                             ):
                                 if criteria_item.get(_fld) is not None:
                                     _parent_entry[_fld] = criteria_item[_fld]
@@ -3334,9 +3906,25 @@ class StudentGrader:
                     "of_produces",
                     "of_value", "of_value_unit", "of_value_label",
                     "exact_match",
+                    "expected_amount",
+                    "sign_sensitive",
+                    "keywords",
+                    "formula",
+                    "column",
+                    "of_tag",
+                    # How the examiner marks this criterion: accepted
+                    # alternative methods, wrong methods that score 0, and the
+                    # comment to give. Question-specific, so it lives on the
+                    # rubric rather than in the shared grading prompt.
+                    "examiner_guidance",
                 ):
                     if _fld in criteria_item and criteria_item.get(_fld) is not None:
                         _crit_entry[_fld] = criteria_item[_fld]
+                # Wire of_tag to of_id if of_id was not explicitly set
+                if "of_tag" in criteria_item and "of_id" not in _crit_entry:
+                    _crit_entry["of_id"] = criteria_item["of_tag"]
+                    if "of_ids" not in _crit_entry:
+                        _crit_entry["of_ids"] = [str(criteria_item["of_tag"])]
                 combined_criteria.append(_crit_entry)
 
         def _collect_answer_text(node: dict, parts_list: list) -> None:
@@ -3664,8 +4252,11 @@ class StudentGrader:
                 # description, so resolution is exact and a near-identical
                 # twin can no longer absorb another criterion's marks.
                 _cid = str(it.get("criterion_id", "") or "").strip()
-                if _cid and _cid not in id_map:
-                    id_map[_cid] = desc
+                if _cid:
+                    if _cid not in id_map:
+                        id_map[_cid] = desc
+                    if _cid.upper() not in id_map:
+                        id_map[_cid.upper()] = desc
                 if desc not in pos_map:
                     pos_map[desc] = len(ordered)
                     ordered.append(desc)
@@ -3816,15 +4407,17 @@ class StudentGrader:
                           if _rn and (_rn in _en or _en in _rn)]
                 if _cands:
                     _paid_idx.add(max(_cands, key=lambda _i: len(_rows_norm[_i])))
-        _unmarked = [_r for _i, _r in enumerate(_rows)
-                     if _i not in _paid_idx and _rows_norm[_i]]
+        _unmarked = [
+            _r for _i, _r in enumerate(_rows)
+            if _i not in _paid_idx and _rows_norm[_i] and _is_legitimate_restatement_line(_r)
+        ]
         if not _unmarked:
-            logger.info("  every student line already earns marks - nothing to flag")
+            logger.info("  no unmarked narrative lines candidate for restatement - nothing to flag")
             return []
 
         logger.info(f"  sending {len(credited_by_id)} credited point(s) in "
                     f"{len(_groups)} working(s); {len(_unmarked)} of {len(_rows)} "
-                    f"line(s) earn nothing and are up for decision")
+                    f"line(s) are candidate descriptive statements")
         try:
             _result = self.restatement_chain.invoke({
                 "credited": "\n".join(_lines_out),
@@ -3853,6 +4446,9 @@ class StudentGrader:
             _why = str(_item.get("why", "") or "").strip()
             if not _line:
                 logger.info(f"    DROP  [{_cid or '?'}] empty line")
+                continue
+            if not _is_legitimate_restatement_line(_line):
+                logger.info(f"    DROP  [{_cid or '?'}] not a valid descriptive statement | {_line[:60]}")
                 continue
             if _cid not in credited_by_id:
                 logger.info(f"    DROP  [{_cid or '?'}] unknown or uncredited id "
@@ -5528,6 +6124,8 @@ class StudentGrader:
             for ev in evidence_items:
                 if not ev or not isinstance(ev, str):
                     continue
+                if _multiline_evidence_present(ev, student_blob, _norm_for_evidence_match):
+                    return True
                 ev_norm = _norm_for_evidence_match(ev)
                 if len(ev_norm) < 12 and not _is_distinctive_short_evidence(ev_norm):
                     continue
@@ -5550,6 +6148,18 @@ class StudentGrader:
                         window = " ".join(words[i:i + 5])
                         if window in student_blob:
                             return True
+                elif len(words) >= 2:
+                    for i in range(0, len(words) - 1):
+                        window = " ".join(words[i:i + 2])
+                        if len(window) >= 8 and window in student_blob:
+                            return True
+                numbers_3 = re.findall(r"\d{3,}", ev_norm)
+                if len(numbers_3) >= 2 and sum(num in student_blob for num in numbers_3) >= 2:
+                    return True
+                numbers = re.findall(r"\d{4,}", ev_norm)
+                if numbers and any(num in student_blob for num in numbers):
+                    if any(w in student_blob for w in words if not w.isdigit()):
+                        return True
             return False
 
         def _unwrap_stringified_lists(d: dict) -> dict:
@@ -5617,18 +6227,47 @@ class StudentGrader:
             except Exception as je:
                 raise GradingError(f"Invalid JSON from grader: {je}") from je
 
-        # Attempt 1: structured output if available
-        try:
-            if self.grade_chain_structured is not None:
-                output = self.grade_chain_structured.invoke(payload)
-                _capture_debug("structured", "received", output_obj=output)
+        def _grade_once() -> dict:
+            """One grading pass: structured output, then text, then a repair pass."""
+            # Attempt 1: structured output if available
+            try:
+                if self.grade_chain_structured is not None:
+                    output = self.grade_chain_structured.invoke(payload)
+                    _capture_debug("structured", "received", output_obj=output)
+                    parsed = _coerce_to_dict(output)
+                    _capture_debug("structured", "parsed", raw_text=json.dumps(parsed, ensure_ascii=False)[:debug_max_chars] if debug_enabled else None)
+                    # Validate schema
+                    validated = LLMGradingResponse(**parsed)
+                    logger.info(f"Grading complete → {self.student_name} (Q{self.question_number}) [structured]")
+                    result = validated.model_dump()
+                    # Guardrail: evidence must be a verbatim quote that exists in the student text.
+                    try:
+                        for g in result.get("grades", []) or []:
+                            for bi in g.get("breakdown", []) or []:
+                                if float(bi.get("marks_awarded", 0) or 0) <= 0:
+                                    continue
+                                ev = bi.get("evidence", [])
+                                ev_list = ev if isinstance(ev, list) else ([str(ev)] if ev else [])
+                                if not _evidence_present_in_student([str(x) for x in ev_list if x is not None]):
+                                    bi["marks_awarded"] = 0.0
+                                    bi["reason"] = ("Marks revoked by guardrails: evidence not found verbatim in student answer")
+                    except Exception:
+                        # Non-fatal: fallback guardrails will still run in _build_grade_doc.
+                        pass
+                    return result
+            except Exception as e:
+                _capture_debug("structured", "error", output_obj=locals().get("output"), error=e)
+                logger.warning(f"Structured grading failed; falling back to text parsing: {e}")
+
+            # Attempt 2: text output + parse
+            try:
+                output = self.grade_chain_text.invoke(payload)
+                _capture_debug("text", "received", output_obj=output)
                 parsed = _coerce_to_dict(output)
-                _capture_debug("structured", "parsed", raw_text=json.dumps(parsed, ensure_ascii=False)[:debug_max_chars] if debug_enabled else None)
-                # Validate schema
+                _capture_debug("text", "parsed", raw_text=json.dumps(parsed, ensure_ascii=False)[:debug_max_chars] if debug_enabled else None)
                 validated = LLMGradingResponse(**parsed)
-                logger.info(f"Grading complete → {self.student_name} (Q{self.question_number}) [structured]")
+                logger.info(f"Grading complete → {self.student_name} (Q{self.question_number}) [text]")
                 result = validated.model_dump()
-                # Guardrail: evidence must be a verbatim quote that exists in the student text.
                 try:
                     for g in result.get("grades", []) or []:
                         for bi in g.get("breakdown", []) or []:
@@ -5640,103 +6279,207 @@ class StudentGrader:
                                 bi["marks_awarded"] = 0.0
                                 bi["reason"] = ("Marks revoked by guardrails: evidence not found verbatim in student answer")
                 except Exception:
-                    # Non-fatal: fallback guardrails will still run in _build_grade_doc.
                     pass
                 return result
-        except Exception as e:
-            _capture_debug("structured", "error", output_obj=locals().get("output"), error=e)
-            logger.warning(f"Structured grading failed; falling back to text parsing: {e}")
+            except Exception as e:
+                _capture_debug("text", "error", output_obj=locals().get("output"), error=e)
+                logger.warning(f"Text grading parse failed; attempting one JSON repair pass: {e}")
+                # Save the exception for the repair block below - `e` is scoped to
+                # this except in Py3 and would be cleared on exit.
+                _text_grade_err = e
 
-        # Attempt 2: text output + parse
-        try:
-            output = self.grade_chain_text.invoke(payload)
-            _capture_debug("text", "received", output_obj=output)
-            parsed = _coerce_to_dict(output)
-            _capture_debug("text", "parsed", raw_text=json.dumps(parsed, ensure_ascii=False)[:debug_max_chars] if debug_enabled else None)
-            validated = LLMGradingResponse(**parsed)
-            logger.info(f"Grading complete → {self.student_name} (Q{self.question_number}) [text]")
-            result = validated.model_dump()
+            # Attempt 3: repair by asking the same model to output strict JSON only
             try:
-                for g in result.get("grades", []) or []:
-                    for bi in g.get("breakdown", []) or []:
-                        if float(bi.get("marks_awarded", 0) or 0) <= 0:
-                            continue
-                        ev = bi.get("evidence", [])
-                        ev_list = ev if isinstance(ev, list) else ([str(ev)] if ev else [])
-                        if not _evidence_present_in_student([str(x) for x in ev_list if x is not None]):
-                            bi["marks_awarded"] = 0.0
-                            bi["reason"] = ("Marks revoked by guardrails: evidence not found verbatim in student answer")
-            except Exception:
-                pass
-            return result
-        except Exception as e:
-            _capture_debug("text", "error", output_obj=locals().get("output"), error=e)
-            logger.warning(f"Text grading parse failed; attempting one JSON repair pass: {e}")
-            # Save the exception for the repair block below - `e` is scoped to
-            # this except in Py3 and would be cleared on exit.
-            _text_grade_err = e
+                # Get the raw text from the previous output if possible
+                raw_content = getattr(output, "content", None) if "output" in locals() else None
+                raw_content = raw_content if raw_content is not None else str(_text_grade_err)
 
-        # Attempt 3: repair by asking the same model to output strict JSON only
+                repair_prompt = (
+                    "You MUST return ONLY valid JSON (no markdown, no commentary). "
+                    "Fix the following output to match this exact schema:\n"
+                    "{\n"
+                    "  \"grades\": [\n"
+                    "    {\n"
+                    "      \"question_number\": string,\n"
+                    "      \"score\": number,\n"
+                    "      \"total_marks\": number,\n"
+                    "      \"comments\": [string, ...],\n"
+                    "      \"correct_words\": [string, ...],\n"
+                    "      \"breakdown\": [\n"
+                    "        {\n"
+                    "          \"criterion\": string,\n"
+                    "          \"marks_awarded\": number,\n"
+                    "          \"max_possible\": number,\n"
+                    "          \"reason\": string,\n"
+                    "          \"evidence\": [string, ...],\n"
+                    "          \"comments_summary\": string\n"
+                    "        }\n"
+                    "      ]\n"
+                    "    }\n"
+                    "  ]\n"
+                    "}\n\n"
+                    "OUTPUT TO FIX:\n"
+                    f"{raw_content}"
+                )
+
+                fixed = llm_grader.invoke(repair_prompt)
+                _capture_debug("repair", "received", output_obj=fixed)
+                fixed_content = getattr(fixed, "content", None)
+                fixed_content = fixed_content if fixed_content is not None else str(fixed)
+                fixed_json = self._extract_json_from_text(str(fixed_content))
+                parsed = json.loads(fixed_json)
+                _capture_debug("repair", "parsed", raw_text=json.dumps(parsed, ensure_ascii=False)[:debug_max_chars] if debug_enabled else None)
+                validated = LLMGradingResponse(**parsed)
+                logger.info(f"Grading complete → {self.student_name} (Q{self.question_number}) [repaired]")
+                result = validated.model_dump()
+                try:
+                    for g in result.get("grades", []) or []:
+                        for bi in g.get("breakdown", []) or []:
+                            if float(bi.get("marks_awarded", 0) or 0) <= 0:
+                                continue
+                            ev = bi.get("evidence", [])
+                            ev_list = ev if isinstance(ev, list) else ([str(ev)] if ev else [])
+                            if not _evidence_present_in_student([str(x) for x in ev_list if x is not None]):
+                                bi["marks_awarded"] = 0.0
+                                bi["reason"] = ("Marks revoked by guardrails: evidence not found verbatim in student answer")
+                except Exception:
+                    pass
+                return result
+            except Exception as e2:
+                _capture_debug("repair", "error", output_obj=locals().get("fixed"), error=e2)
+                logger.error("Grading chain failed", exc_info=True)
+                raise GradingError("Grading step failed") from e2
+
+        # Several independent passes, then a per-criterion majority. A single
+        # pass can score the same script differently from one run to the next
+        # (temperature 0 does not make the model deterministic); the majority
+        # of three agrees with itself far more often. GRADING_VOTES=1 restores
+        # the single pass.
         try:
-            # Get the raw text from the previous output if possible
-            raw_content = getattr(output, "content", None) if "output" in locals() else None
-            raw_content = raw_content if raw_content is not None else str(_text_grade_err)
+            votes = max(1, int(os.getenv("GRADING_VOTES", "3")))
+        except ValueError:
+            votes = 3
+        if votes == 1:
+            return _grade_once()
 
-            repair_prompt = (
-                "You MUST return ONLY valid JSON (no markdown, no commentary). "
-                "Fix the following output to match this exact schema:\n"
-                "{\n"
-                "  \"grades\": [\n"
-                "    {\n"
-                "      \"question_number\": string,\n"
-                "      \"score\": number,\n"
-                "      \"total_marks\": number,\n"
-                "      \"comments\": [string, ...],\n"
-                "      \"correct_words\": [string, ...],\n"
-                "      \"breakdown\": [\n"
-                "        {\n"
-                "          \"criterion\": string,\n"
-                "          \"marks_awarded\": number,\n"
-                "          \"max_possible\": number,\n"
-                "          \"reason\": string,\n"
-                "          \"evidence\": [string, ...],\n"
-                "          \"comments_summary\": string\n"
-                "        }\n"
-                "      ]\n"
-                "    }\n"
-                "  ]\n"
-                "}\n\n"
-                "OUTPUT TO FIX:\n"
-                f"{raw_content}"
-            )
+        from concurrent.futures import ThreadPoolExecutor
+        runs: list[dict] = []
+        errors: list[BaseException] = []
+        with ThreadPoolExecutor(max_workers=votes) as pool:
+            futures = [pool.submit(_grade_once) for _ in range(votes)]
+            for fut in futures:
+                try:
+                    runs.append(fut.result())
+                except Exception as exc:  # one failed pass must not fail the script
+                    errors.append(exc)
+        if not runs:
+            raise GradingError("Grading step failed") from (errors[0] if errors else None)
+        if errors:
+            logger.warning(f"{len(errors)} of {votes} grading passes failed; voting on {len(runs)}")
+        return self._merge_grading_votes(runs)
 
-            fixed = llm_grader.invoke(repair_prompt)
-            _capture_debug("repair", "received", output_obj=fixed)
-            fixed_content = getattr(fixed, "content", None)
-            fixed_content = fixed_content if fixed_content is not None else str(fixed)
-            fixed_json = self._extract_json_from_text(str(fixed_content))
-            parsed = json.loads(fixed_json)
-            _capture_debug("repair", "parsed", raw_text=json.dumps(parsed, ensure_ascii=False)[:debug_max_chars] if debug_enabled else None)
-            validated = LLMGradingResponse(**parsed)
-            logger.info(f"Grading complete → {self.student_name} (Q{self.question_number}) [repaired]")
-            result = validated.model_dump()
+    def _merge_grading_votes(self, runs: list[dict]) -> dict:
+        """Combine several grading passes into one, criterion by criterion.
+
+        Each criterion takes the mark most passes gave it (the median when
+        every pass differs), and keeps the reason and evidence of a pass that
+        gave that mark. A criterion a pass did not return counts as 0 for that
+        pass. Comments and off-topic points come from the pass that agrees
+        with the majority most often, so the feedback matches the marks.
+        """
+        if len(runs) == 1:
+            return runs[0]
+
+        id_by_desc = {d: c for c, d in (self._criterion_id_map_last_run or {}).items()}
+
+        def _key(item: dict) -> str:
+            cid = str(item.get("criterion_id", "") or "").strip().upper()
+            if cid:
+                return cid
+            crit = str(item.get("criterion", "") or "").strip()
+            if crit in id_by_desc:
+                return str(id_by_desc[crit]).upper()
+            head = crit[:60].lower()
+            for desc, rid in id_by_desc.items():
+                if head and desc[:60].lower() == head:
+                    return str(rid).upper()
+            return re.sub(r"\s+", " ", crit.lower())[:80]
+
+        def _marks(item: Optional[dict]) -> float:
+            if not item:
+                return 0.0
             try:
-                for g in result.get("grades", []) or []:
-                    for bi in g.get("breakdown", []) or []:
-                        if float(bi.get("marks_awarded", 0) or 0) <= 0:
-                            continue
-                        ev = bi.get("evidence", [])
-                        ev_list = ev if isinstance(ev, list) else ([str(ev)] if ev else [])
-                        if not _evidence_present_in_student([str(x) for x in ev_list if x is not None]):
-                            bi["marks_awarded"] = 0.0
-                            bi["reason"] = ("Marks revoked by guardrails: evidence not found verbatim in student answer")
-            except Exception:
-                pass
-            return result
-        except Exception as e2:
-            _capture_debug("repair", "error", output_obj=locals().get("fixed"), error=e2)
-            logger.error("Grading chain failed", exc_info=True)
-            raise GradingError("Grading step failed") from e2
+                return round(float(item.get("marks_awarded", 0) or 0) * 4) / 4
+            except (TypeError, ValueError):
+                return 0.0
+
+        per_run: list[dict[str, dict]] = []
+        order: list[str] = []
+        for run in runs:
+            grades = run.get("grades") or [{}]
+            items: dict[str, dict] = {}
+            for item in (grades[0].get("breakdown") or []):
+                k = _key(item)
+                if not k:
+                    continue
+                if k not in items or _marks(item) > _marks(items[k]):
+                    items[k] = item
+                if k not in order:
+                    order.append(k)
+            per_run.append(items)
+
+        consensus: dict[str, float] = {}
+        for k in order:
+            vals = [_marks(items.get(k)) for items in per_run]
+            counts = Counter(vals)
+            top = max(counts.values())
+            leaders = [v for v, c in counts.items() if c == top]
+            consensus[k] = leaders[0] if len(leaders) == 1 else sorted(vals)[(len(vals) - 1) // 2]
+
+        agreement = [
+            sum(1 for k in order if _marks(items.get(k)) == consensus[k])
+            for items in per_run
+        ]
+        base_idx = agreement.index(max(agreement))
+        search_order = [base_idx] + [i for i in range(len(per_run)) if i != base_idx]
+
+        merged: list[dict] = []
+        disagreements = 0
+        for k in order:
+            target = consensus[k]
+            if len({_marks(items.get(k)) for items in per_run}) > 1:
+                disagreements += 1
+            chosen = None
+            for i in search_order:
+                item = per_run[i].get(k)
+                if item is not None and _marks(item) == target:
+                    chosen = copy.deepcopy(item)
+                    break
+            if chosen is None:
+                # The majority left this criterion out or gave it 0; keep a
+                # returned copy so the criterion stays visible, at 0.
+                for i in search_order:
+                    if per_run[i].get(k) is not None:
+                        chosen = copy.deepcopy(per_run[i][k])
+                        break
+                if chosen is None:
+                    continue
+                chosen["marks_awarded"] = 0.0
+                chosen["reason"] = (
+                    "Not awarded: most grading passes found no evidence for this point. "
+                    + str(chosen.get("reason", "") or "")
+                ).strip()
+            merged.append(chosen)
+
+        result = copy.deepcopy(runs[base_idx])
+        grade = (result.get("grades") or [{}])[0]
+        grade["breakdown"] = merged
+        grade["score"] = sum(_marks(it) for it in merged)
+        logger.info(
+            f"Vote merge: {len(runs)} passes, {len(order)} criteria, "
+            f"{disagreements} decided by majority; comments from pass {base_idx + 1}"
+        )
+        return result
 
     def _build_grade_doc(self, parsed_grades: dict, questions_data: dict) -> dict:
         now_iso = datetime.utcnow().isoformat()
@@ -6090,10 +6833,12 @@ class StudentGrader:
             )
             candidates = [m.group(0) for m in expr_re.finditer(ev_blob)]
             candidates.extend([m.group(0) for m in muldiv_re.finditer(ev_blob)])
+            candidates.extend(re.findall(r"\(([^)]+)\)", ev_blob))
             if "=" in ev_blob:
                 rhs = ev_blob.split("=", 1)[1]
                 candidates.extend([m.group(0) for m in expr_re.finditer(rhs)])
                 candidates.extend([m.group(0) for m in muldiv_re.finditer(rhs)])
+                candidates.extend(re.findall(r"\(([^)]+)\)", rhs))
 
             seen = set()
             for expr in candidates:
@@ -6475,6 +7220,8 @@ class StudentGrader:
             for ev in evidence_items:
                 if not ev or not isinstance(ev, str):
                     continue
+                if _multiline_evidence_present(ev, student_blob_norm, _norm_for_evidence_match):
+                    return True
                 ev_norm = _norm_for_evidence_match(ev)
                 if len(ev_norm) < 12 and not _is_distinctive_short_evidence(ev_norm):
                     continue
@@ -6743,7 +7490,7 @@ class StudentGrader:
             # SKIP for synthesized criteria and holistic grading - theoretical answers naturally share
             # terminology with the model answer.
             if marks_awarded > 0 and evid_list and student_blob_norm and not self._criteria_were_synthesized and not self._holistic_grading:
-                if reference_blob_norm and not _evidence_has_untainted_snippet(evid_list):
+                if reference_blob_norm and not _evidence_has_untainted_snippet(evid_list) and "presentation" not in criterion.lower():
                     evidence_warnings.append(f"Marks revoked (evidence appears in question/markscheme, not student work): {criterion}")
                     marks_awarded = 0.0
 
@@ -6972,14 +7719,23 @@ class StudentGrader:
                                 if self._contains_number_variant(ev_blob, _stated_ans):
                                     expected_ok = True
 
+                        if not (literal_ok or expected_ok):
+                            kw = (self._keywords_by_criterion_last_run or {}).get(str(criterion), [])
+                            kw_nums = [k for k in kw if any(c.isdigit() for c in k)]
+                            if kw_nums:
+                                matched_kws = sum(1 for k in kw_nums if self._contains_number_variant(ev_blob, k) or k in ev_blob)
+                                if matched_kws >= 2:
+                                    expected_ok = True
+
                         # If LLM explicitly identified this as own-figure (OF), skip number
                         # mismatch revocation. In UK professional exams, OF for CALC criteria
                         # awards FULL marks - the student is not penalised twice for one wrong
                         # input. The numbers in evidence will differ from the criterion by design.
-                        _reason_text_nm = str(item.get("reason", "")).lower()
-                        _is_of_nm = bool(re.search(
-                            r"\bof\b|\bown.?figure\b|\bown.?fig\b", _reason_text_nm
-                        ))
+                        _raw_reason = str(item.get("reason", ""))
+                        _is_of_nm = bool(
+                            re.search(r"\bOF\b", _raw_reason) or
+                            re.search(r"\bown.?figure\b|\bown.?fig\b", _raw_reason, re.IGNORECASE)
+                        )
                         # Rubric-driven OF signal: any criterion with `of_source_ids`
                         # populated (i.e. downstream of an upstream OF) is a candidate for
                         # OF bypass - a number mismatch here can be a legitimate carry from
@@ -7177,11 +7933,31 @@ class StudentGrader:
                         _rubric_target = int(round(float(_prod_val)))
                     except (TypeError, ValueError):
                         pass
+            if _rubric_target is None:
+                _exp_amt = (self._expected_amount_by_criterion_last_run or {}).get(criterion)
+                if _exp_amt is not None:
+                    try:
+                        _rubric_target = int(round(abs(float(_exp_amt))))
+                    except (TypeError, ValueError):
+                        pass
+            if _rubric_target is None and criterion:
+                # Also check if criterion description contains '= [number]'
+                m = re.search(r"=\s*\(?\s*([0-9,]+(?:\.[0-9]+)?)\s*\)?", str(criterion))
+                if m:
+                    try:
+                        _rubric_target = int(round(abs(float(m.group(1).replace(",", "")))))
+                    except (TypeError, ValueError):
+                        pass
             if _rubric_target is not None and _rubric_target != 0:
                 bd_item["_target_value"] = _rubric_target
-                bd_item["_target_value_variants"] = sorted(
-                    _value_variants_for_search(_rubric_target)
-                )
+                variants = set(_value_variants_for_search(_rubric_target))
+                variants.add(str(_rubric_target))
+                variants.add(f"{_rubric_target:,}")
+                kw_list = (self._keywords_by_criterion_last_run or {}).get(criterion, [])
+                for kw in kw_list:
+                    if kw and re.fullmatch(r"[-+]?[0-9,]+(?:\.[0-9]+)?", kw.strip()):
+                        variants.add(kw.strip())
+                bd_item["_target_value_variants"] = sorted(variants)
 
             # For holistic grading, preserve sub-question metadata for the annotator.
             if self._holistic_grading:
@@ -7397,6 +8173,44 @@ class StudentGrader:
                             _dup_crit_raw, "") or "").lower()
                         if (_keeper_cat == "journal") != (_dup_cat == "journal"):
                             continue
+
+                        # MULTI-COMPONENT CALCULATION LINE GUARD:
+                        # When a calculation line contains multiple numbers or components (e.g.
+                        # Net assets at disposal "(100,000 + 83,560 + (9/12 x 12,000))",
+                        # PPE "(1,226,500 + 409,500 + 16,300 - 9,780)",
+                        # Inventories "(386,650 + 298,520 - 5,900)", Receivables, Payables, Taxation, Cash, etc.),
+                        # each component is evaluated separately. They share the same evidence line
+                        # because the student wrote the entire formula in one place.
+                        # These are distinct criteria and must NEVER cross-null or zero each other out!
+                        _id_k = str(normalized_breakdown[_idxs_sorted[0]].get("criterion_id", "") or "").strip().upper()
+                        _id_d = str(normalized_breakdown[_dup_idx].get("criterion_id", "") or "").strip().upper()
+
+                        if _id_k and _id_d and _id_k != _id_d:
+                            # Both criteria have distinct IDs in the rubric: never cross-null each other!
+                            continue
+
+                        _keeper_exp = self._expected_amount_by_criterion_last_run.get(_keeper_crit)
+                        _dup_exp = self._expected_amount_by_criterion_last_run.get(_dup_crit_raw)
+
+                        # Check 1: Criteria have distinct expected amounts
+                        if _keeper_exp is not None and _dup_exp is not None and _keeper_exp != _dup_exp:
+                            continue
+
+                        # Check 2: Distinct numbers in criteria descriptions (excluding standard mark weights)
+                        _nums_k = set(self._numbers_in_text(_keeper_crit))
+                        _nums_d = set(self._numbers_in_text(_dup_crit_raw))
+                        _mark_weights = {"0.25", "0.5", "0.50", "0.75", "1", "1.0", "1.5", "2", "2.0"}
+                        _nums_k_figs = {n for n in _nums_k if n not in _mark_weights}
+                        _nums_d_figs = {n for n in _nums_d if n not in _mark_weights}
+                        if _nums_k_figs and _nums_d_figs and not (_nums_k_figs & _nums_d_figs):
+                            continue
+
+                        # Check 3: Parent vs Subsidiary components
+                        if ("parent" in _keep_crit_lower and "subsidiary" in _dup_crit) or (
+                            "subsidiary" in _keep_crit_lower and "parent" in _dup_crit
+                        ):
+                            continue
+
                         # Zero out when EITHER:
                         #   (a) the pair was grouped via substring containment
                         #       (dup's evidence sits inside keeper's or vice
@@ -7617,6 +8431,37 @@ class StudentGrader:
                 ("contradiction", lambda: _reject_contradictory_awards(
                     normalized_breakdown
                 )),
+                (
+                    "elimination-amount",
+                    lambda: _verify_elimination_and_numeric_criteria(
+                        normalized_breakdown,
+                        expected_amount_map=self._expected_amount_by_criterion_last_run,
+                        criterion_id_by_desc={
+                            d: c for c, d in
+                            (self._criterion_id_map_last_run or {}).items()
+                        },
+                        of_ids_map=self._of_ids_by_criterion_last_run,
+                        of_source_ids_map=self._of_source_ids_by_criterion_last_run,
+                    ),
+                ),
+                (
+                    "given-figure",
+                    lambda: _apply_given_figure_check(
+                        normalized_breakdown,
+                        expected_amount_map=self._expected_amount_by_criterion_last_run,
+                        of_source_ids_map=self._of_source_ids_by_criterion_last_run,
+                        student_text=self._student_text_last_run or "",
+                    ),
+                ),
+                (
+                    "arithmetic-slip",
+                    lambda: _apply_arithmetic_slip_rule(
+                        normalized_breakdown,
+                        expected_amount_map=self._expected_amount_by_criterion_last_run,
+                        of_source_ids_map=self._of_source_ids_by_criterion_last_run,
+                        student_text=self._student_text_last_run or "",
+                    ),
+                ),
             ):
                 try:
                     sum_awarded_calc -= _guard()
@@ -7653,6 +8498,8 @@ class StudentGrader:
                         return False
                     c = crit.strip().lower()
                     if c.startswith("dr ") or c.startswith("cr "):
+                        return False
+                    if "presentation" in c:
                         return False
                     if re.search(r"\d", crit):
                         return False
@@ -7834,6 +8681,39 @@ class StudentGrader:
         if total_max > 0:
             rounded_total = min(rounded_total, total_max)
 
+        # ── Mark tags for the annotated script ──────────────────────────────
+        # The examiner writes "OF" beside a mark only where the student's own,
+        # different figure still earned it, and "MP" beside the presentation
+        # mark. Decided here from the FINAL marks, after every guard: the
+        # grading model labels OF loosely, including on figures that are
+        # simply correct, which reads on the script as an extra mark.
+        if normalized_breakdown and not self._holistic_grading:
+            _exp_map = self._expected_amount_by_criterion_last_run or {}
+            _of_src = self._of_source_ids_by_criterion_last_run or {}
+            _st = self._student_text_last_run or ""
+            for _bi in normalized_breakdown:
+                _crit = str(_bi.get("criterion", "") or "")
+                try:
+                    _m = float(_bi.get("marks_awarded", 0) or 0)
+                except (TypeError, ValueError):
+                    _m = 0.0
+                _tag = ""
+                if _m > 0:
+                    if re.match(r"^\s*presentation\b", _crit, re.IGNORECASE):
+                        _tag = "MP"
+                    elif _of_src.get(_crit) and _exp_map.get(_crit) is not None:
+                        try:
+                            _w, _ = _evidence_window(_bi.get("evidence_list") or [], _st)
+                            if (
+                                _w
+                                and _numbers_in_text(_w)
+                                and not _value_shown(_exp_map[_crit], _w)
+                            ):
+                                _tag = "OF"
+                        except Exception:
+                            _tag = ""
+                _bi["mark_tag"] = _tag
+
         # ── Rubric completeness ─────────────────────────────────────────────
         # Every scoreable rubric criterion must appear in the saved breakdown,
         # even when the grading model never returned it. Without this an
@@ -7939,6 +8819,7 @@ class StudentGrader:
                         _tgt["_restated_at"].append(_line)
 
             _notes: list[dict] = []
+            _seen_cids: set[str] = set()
             for _bi in list(normalized_breakdown):
                 _lines = _bi.get("_restated_at") or []
                 if not _lines or float(_bi.get("marks_awarded", 0) or 0) <= 0:
@@ -7948,6 +8829,12 @@ class StudentGrader:
                                  if _credited_ev else -1)
                 _cid_log = _bi.get("criterion_id", "") or "?"
                 for _line in _lines:
+                    if _cid_log in _seen_cids:
+                        logger.info(f"    DROP  [{_cid_log}] already has a restatement note")
+                        continue
+                    if not _is_legitimate_restatement_line(_line):
+                        logger.info(f"    DROP  [{_cid_log}] not a valid descriptive statement | {_line[:55]}")
+                        continue
                     _ln_norm = _norm_for_evidence_match(_line)
                     # Never put a note on a line that earns marks somewhere.
                     if not _ln_norm:
@@ -7967,6 +8854,7 @@ class StudentGrader:
                     else:
                         _dir_note = "below" if _credited_pos > _ln_pos else "above"
                     _already_anchored.add(_ln_norm)
+                    _seen_cids.add(_cid_log)
                     logger.info(f"    NOTE  [{_cid_log}] \"Marks given {_dir_note}\" on: "
                                 f"{_line[:55]}")
                     logger.info(f"          marks are at: "
@@ -7985,6 +8873,11 @@ class StudentGrader:
                         "comments_summary": "",
                         "_restated_note": True,
                     })
+
+            if len(_notes) > 3:
+                logger.info(f"  Capping restatement notes from {len(_notes)} to 3 most descriptive")
+                _notes = sorted(_notes, key=lambda n: len(n.get("evidence", "")), reverse=True)[:3]
+
             if _notes:
                 normalized_breakdown.extend(_notes)
                 _above = sum(1 for _n in _notes if "given above" in _n["reason"])

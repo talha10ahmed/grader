@@ -192,158 +192,195 @@ def _place_score_label(
     score_x = rect.x1 + 3
     placement_anchored_to_value = False
 
-    # If the anchor rect ITSELF contains a numeric value, keep the score
-    # right after that rect — don't push it to the end of the row. Prevents
-    # "floating scores" on wide table rows where the anchor is one specific
-    # cell (e.g. `18,150,000.00`) but the rightmost numeric word is a
-    # different cell (e.g. `15,400,000.00` in the "post acq" column).
+    # Check if this rect is a numeric value component (e.g. 1,226,500 or 409,500 or 16,300)
+    # where marks should be placed directly ABOVE the component, exactly like in the ACR PDF scheme.
     anchor_is_value = _rect_contains_number(page, rect)
+    is_short_mark = not str(score_text).startswith("Marks given")
+    is_numeric_component = anchor_is_value and is_short_mark and (rect.width <= 160)
 
-    # Step 1 — line has a value column further right than the rect:
-    # place score AFTER the value on the same line (best clarity).
-    # Skip when anchor rect already IS a numeric cell — see above.
-    if not anchor_is_value:
-        value_x = _find_value_x_on_line(page, rect)
-        if value_x is not None and value_x > rect.x1 + 5:
-            proposed = value_x + 3
-            if proposed < page.rect.width - 25:
-                score_x = proposed
-                placement_anchored_to_value = True
-            else:
-                # No room to the right of the value — place ABOVE it.
-                score_x = min(max(value_x - 25, 50), page.rect.width - 70)
-                score_y = max(rect.y0 - (score_font + 2), 10)
-                placement_anchored_to_value = True
-
-    # Step 2 — rect itself reaches the right margin (full-line evidence
-    # including the value). Default rect.x1 + 3 would push off-page.
-    if score_x > page.rect.width - 25 and not placement_anchored_to_value:
-        score_x = min(max(rect.x1 - 30, 50), page.rect.width - 70)
-        score_y = max(rect.y0 - (score_font + 2), 10)
-        placement_anchored_to_value = True
+    approx_w = max(14.0, len(str(score_text)) * score_font * 0.55 + 2)
 
     def _score_box(x: float, y: float) -> fitz.Rect:
-        return fitz.Rect(x, y - (score_font + 1), x + 52, y + 3)
+        return fitz.Rect(x - 1, y - (score_font + 1), x + approx_w, y + 1)
 
-    placed_box = _score_box(max(score_x, 50), score_y)
-    if any(placed_box.intersects(b) for b in nearby_boxes):
-        # When value-anchored, keep alternatives in the value column region
-        # so stacked labels (two criteria on same line) stay near the value
-        # rather than jumping back to the descriptive-text side.
-        if placement_anchored_to_value:
-            candidates_x = [
-                min(score_x + 20, page.rect.width - 70),
-                min(score_x + 40, page.rect.width - 70),
-                max(score_x - 25, 50),
-                max(score_x - 45, 50),
-            ]
-        elif anchor_is_value:
-            # Rect is a value cell — try positions just right of the rect
-            # (progressively further) before falling back to left / above.
-            # Keeps stacked labels on the SAME visual row rather than
-            # shifting to the next row (which looks like a floating mark).
-            candidates_x = [
-                min(rect.x1 + 20, page.rect.width - 70),
-                min(rect.x1 + 40, page.rect.width - 70),
-                min(rect.x1 + 60, page.rect.width - 70),
-                max(rect.x0 - 40, 50),
-            ]
-        else:
-            candidates_x = [
-                max(rect.x0 - 40, 50),
-                min(rect.x1 + 18, page.rect.width - 70),
-                min(rect.x1 + 38, page.rect.width - 70),
-            ]
-        found = False
-        for cx in candidates_x:
-            cb = _score_box(cx, score_y)
-            if not any(cb.intersects(b) for b in nearby_boxes):
+    if is_numeric_component:
+        # Teacher-style / ACR model-answer scheme:
+        # Place marks (e.g. 0.5) DIRECTLY ABOVE the value component.
+        score_font = max(6.5, min(8.0, local_fs * 0.8))
+        approx_w = max(14.0, len(str(score_text)) * score_font * 0.55 + 2)
+        center_x = (rect.x0 + rect.x1) / 2
+
+        cand_y_above = max(rect.y0 - 2, 8)
+
+        # Priority 1: DIRECTLY ABOVE the component.
+        # Try candidate X positions within the component's width to find clear space above
+        cand_x_candidates = [
+            max(10.0, center_x - approx_w / 2),
+            min(page.rect.width - approx_w - 5, rect.x1 - approx_w),
+            max(10.0, rect.x0),
+            max(10.0, center_x - approx_w / 2 + 4),
+            max(10.0, center_x - approx_w / 2 - 4),
+            max(10.0, center_x - approx_w / 2 + 8),
+            max(10.0, center_x - approx_w / 2 - 8),
+        ]
+
+        placed = False
+        for cx in cand_x_candidates:
+            b_above = _score_box(cx, cand_y_above)
+            if not any(b_above.intersects(b) for b in nearby_boxes) and not _box_overlaps_page_text(page, b_above):
                 score_x = cx
-                placed_box = cb
-                found = True
+                score_y = cand_y_above
+                placed_box = b_above
+                placed = True
                 break
 
-        if not found:
-            # BEFORE shifting Y (which can push labels to the next row and
-            # look like floating marks with no anchor), try placing ABOVE
-            # the rect first — teacher-style "score sits above the value"
-            # when there's no room to the right.
-            above_y = max(rect.y0 - (score_font + 2), 10)
-            above_box = _score_box(max(score_x, 50), above_y)
-            # Must clear page TEXT as well as sibling labels. Checking only the
-            # labels let a score hop onto the row above and read as marking it:
-            # in a table with 12pt rows, two marks on the same data row were
-            # pushed up onto the COLUMN HEADER, so the reader saw 0.25 against
-            # "$" and "Rate" instead of against the figures underneath.
-            if (
-                not any(above_box.intersects(b) for b in nearby_boxes)
-                and not _box_overlaps_page_text(page, above_box)
-            ):
-                score_y = above_y
-                placed_box = above_box
-                found = True
+        # Priority 2: If above is blocked by text on the line above (e.g. for wrapped lines like 9,780),
+        # place on the SAME line right after the number / expression.
+        if not placed:
+            line_y = (rect.y0 + rect.y1) / 2
+            word_x1 = rect.x1
+            for w in _page_words(page):
+                if abs((w[1] + w[3]) / 2 - line_y) < 4:
+                    if w[0] <= rect.x1 + 1 and w[2] > word_x1:
+                        word_x1 = w[2]
+            same_line_x = word_x1 + 3
+            same_line_y = (rect.y0 + rect.y1) / 2 + score_font * 0.35
+            b_same = _score_box(same_line_x, same_line_y)
+            if not any(b_same.intersects(b) for b in nearby_boxes) and not _box_overlaps_page_text(page, b_same):
+                score_x = same_line_x
+                score_y = same_line_y
+                placed_box = b_same
+                placed = True
 
-        if not found:
-            # Stay CLOSE to the anchor. Stepping straight out to the margin
-            # keeps the label on the right ROW but severs it from the value it
-            # marks - on a table row carrying three marks they all ended up
-            # stacked at the page edge, where a reader cannot tell which figure
-            # each belongs to. Walk rightward in small steps, and only reach for
-            # the margin once the row is genuinely full.
-            for _step in (14, 28, 42, 56):
-                _cx = min(score_x + _step, margin_x)
+        # Priority 3: Try slightly below rect ONLY if it does NOT collide with any page text!
+        if not placed:
+            cand_y_below = min(rect.y1 + score_font + 2, page.rect.height - 10)
+            b_below = _score_box(center_x - approx_w / 2, cand_y_below)
+            if not any(b_below.intersects(b) for b in nearby_boxes) and not _box_overlaps_page_text(page, b_below):
+                score_x = center_x - approx_w / 2
+                score_y = cand_y_below
+                placed_box = b_below
+                placed = True
+
+        # Priority 4: Fallback: place above rect
+        if not placed:
+            score_x = max(10.0, center_x - approx_w / 2)
+            score_y = cand_y_above
+            placed_box = _score_box(score_x, score_y)
+    else:
+        # Step 1 — line has a value column further right than the rect:
+        # place score AFTER the value on the same line (best clarity).
+        # Skip when anchor rect already IS a numeric cell — see above.
+        if not anchor_is_value:
+            value_x = _find_value_x_on_line(page, rect)
+            if value_x is not None and value_x > rect.x1 + 5:
+                proposed = value_x + 3
+                if proposed < page.rect.width - 25:
+                    score_x = proposed
+                    placement_anchored_to_value = True
+                else:
+                    # No room to the right of the value — place ABOVE it.
+                    score_x = min(max(value_x - 25, 50), page.rect.width - 70)
+                    score_y = max(rect.y0 - (score_font + 2), 10)
+                    placement_anchored_to_value = True
+
+        # Step 2 — rect itself reaches the right margin (full-line evidence
+        # including the value). Default rect.x1 + 3 would push off-page.
+        if score_x > page.rect.width - 25 and not placement_anchored_to_value:
+            score_x = min(max(rect.x1 - 30, 50), page.rect.width - 70)
+            score_y = max(rect.y0 - (score_font + 2), 10)
+            placement_anchored_to_value = True
+
+        placed_box = _score_box(max(score_x, 50), score_y)
+        if any(placed_box.intersects(b) for b in nearby_boxes):
+            if placement_anchored_to_value:
+                candidates_x = [
+                    min(score_x + 20, page.rect.width - 70),
+                    min(score_x + 40, page.rect.width - 70),
+                    max(score_x - 25, 50),
+                    max(score_x - 45, 50),
+                ]
+            elif anchor_is_value:
+                candidates_x = [
+                    min(rect.x1 + 20, page.rect.width - 70),
+                    min(rect.x1 + 40, page.rect.width - 70),
+                    min(rect.x1 + 60, page.rect.width - 70),
+                    max(rect.x0 - 40, 50),
+                ]
+            else:
+                candidates_x = [
+                    max(rect.x0 - 40, 50),
+                    min(rect.x1 + 18, page.rect.width - 70),
+                    min(rect.x1 + 38, page.rect.width - 70),
+                ]
+            found = False
+            for cx in candidates_x:
+                cb = _score_box(cx, score_y)
+                if not any(cb.intersects(b) for b in nearby_boxes):
+                    score_x = cx
+                    placed_box = cb
+                    found = True
+                    break
+
+            if not found:
+                above_y = max(rect.y0 - (score_font + 2), 10)
+                above_box = _score_box(max(score_x, 50), above_y)
+                if (
+                    not any(above_box.intersects(b) for b in nearby_boxes)
+                    and not _box_overlaps_page_text(page, above_box)
+                ):
+                    score_y = above_y
+                    placed_box = above_box
+                    found = True
+
+            if not found:
+                for _step in (14, 28, 42, 56):
+                    _cx = min(score_x + _step, margin_x)
+                    cb = _score_box(_cx, score_y)
+                    if (
+                        not any(cb.intersects(b) for b in nearby_boxes)
+                        and not _box_overlaps_page_text(page, cb)
+                    ):
+                        score_x, placed_box, found = _cx, cb, True
+                        break
+                if not found:
+                    mb = _score_box(margin_x, score_y)
+                    if not any(mb.intersects(b) for b in nearby_boxes):
+                        score_x, placed_box, found = margin_x, mb, True
+
+            if not found:
+                for _shift in range(3):
+                    score_y = min(
+                        score_y + (score_font * 0.5 + 1),
+                        page.rect.height - 10,
+                    )
+                    cb = _score_box(max(score_x, 50), score_y)
+                    if not any(cb.intersects(b) for b in nearby_boxes):
+                        placed_box = cb
+                        break
+
+        if _box_overlaps_page_text(page, placed_box):
+            resolved = False
+            for _cx in (
+                min(placed_box.x0 + 22, margin_x),
+                min(placed_box.x0 + 44, margin_x),
+                margin_x,
+                margin_x + 22,
+            ):
                 cb = _score_box(_cx, score_y)
                 if (
                     not any(cb.intersects(b) for b in nearby_boxes)
                     and not _box_overlaps_page_text(page, cb)
                 ):
-                    score_x, placed_box, found = _cx, cb, True
+                    score_x, placed_box, resolved = _cx, cb, True
                     break
-            if not found:
-                mb = _score_box(margin_x, score_y)
-                if not any(mb.intersects(b) for b in nearby_boxes):
-                    score_x, placed_box, found = margin_x, mb, True
+            if not resolved:
+                shifted_y = max(score_y - 10, 10)
+                shifted_box = _score_box(max(score_x, 50), shifted_y)
+                if not any(shifted_box.intersects(b) for b in nearby_boxes):
+                    score_y = shifted_y
+                    placed_box = shifted_box
 
-        if not found:
-            # Last resort: shift DOWN, but only a tiny amount — half a font
-            # height (~5px) — so the label stays visually attached to the
-            # anchor rect's row. Larger shifts turn stacked labels into
-            # "floating" orphans on the next physical row.
-            for _shift in range(3):
-                score_y = min(
-                    score_y + (score_font * 0.5 + 1),
-                    page.rect.height - 10,
-                )
-                cb = _score_box(max(score_x, 50), score_y)
-                if not any(cb.intersects(b) for b in nearby_boxes):
-                    placed_box = cb
-                    break
-
-    if _box_overlaps_page_text(page, placed_box):
-        # Resolve the overlap SIDEWAYS first, staying on the anchor's row. The
-        # old behaviour jumped 10pt up, which on a normal 10-12pt row grid is
-        # exactly one line - trading an overlap for a label that appears to
-        # mark the row above.
-        resolved = False
-        for _cx in (
-            min(placed_box.x0 + 22, margin_x),
-            min(placed_box.x0 + 44, margin_x),
-            margin_x,
-            margin_x + 22,
-        ):
-            cb = _score_box(_cx, score_y)
-            if (
-                not any(cb.intersects(b) for b in nearby_boxes)
-                and not _box_overlaps_page_text(page, cb)
-            ):
-                score_x, placed_box, resolved = _cx, cb, True
-                break
-        if not resolved:
-            shifted_y = max(score_y - 10, 10)
-            shifted_box = _score_box(max(score_x, 50), shifted_y)
-            if not any(shifted_box.intersects(b) for b in nearby_boxes):
-                score_y = shifted_y
-                placed_box = shifted_box
 
     page.insert_text(
         (max(score_x, 50), score_y),
@@ -663,13 +700,14 @@ def add_main_score(
                     )
                     continue
 
-                x = heading_rect.x0 - CONFIG['main_score_offset_x']
-                y = heading_rect.y0 + CONFIG['main_score_offset_y'] - 10
+                f_size = 12 if len(score_text) > 25 else CONFIG['main_score_fontsize']
+                x = max(30, heading_rect.x0 - CONFIG['main_score_offset_x'])
+                y = max(30, heading_rect.y0 + CONFIG['main_score_offset_y'] - 10)
 
                 page.insert_text(
                     (x, y),
                     score_text,
-                    fontsize=CONFIG['main_score_fontsize'],
+                    fontsize=f_size,
                     color=CONFIG['main_score_color'],
                 )
                 logger.info(
@@ -681,10 +719,11 @@ def add_main_score(
     # Fallback: top-left of the first allowed page
     if allowed_pages:
         fallback_page = doc[allowed_pages[0] - 1]
+        f_size = 12 if len(score_text) > 25 else CONFIG['main_score_fontsize']
         fallback_page.insert_text(
             (30, 30),
             score_text,
-            fontsize=CONFIG['main_score_fontsize'],
+            fontsize=f_size,
             color=CONFIG['main_score_color'],
         )
         logger.info(

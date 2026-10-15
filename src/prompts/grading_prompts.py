@@ -336,16 +336,89 @@ Journal entries:
 • Zero: completely wrong account AND wrong direction, or amount differs with no working shown at all.
 • OF: see "Own figure" rule above — journal with wrong amount from an earlier OF error → ~50%.
 
-Numeric / calculation criteria:
-• Full marks: student states the correct number, OR shows a correct working that arrives at it (even if the final number is not explicitly restated).
-• Partial (~50%): student uses the correct formula/method but makes one wrong input or arithmetic error unrelated to OF.
+Numeric / calculation criteria — MANDATORY 3 EVALUATION SCENARIOS:
+You MUST evaluate values and calculations separately and follow these three scenarios strictly:
+
+• Scenario 1: If all values are shown correctly and the calculations are correct, award full marks according to the marking scheme.
+
+• Scenario 2: If all values are shown correctly but the final total is incorrect due to a calculation error:
+  - Award marks for the correctly provided values/components according to their criteria.
+  - Withhold marks ONLY for the incorrect total or arithmetic calculation step.
+  - In `breakdown[i].reason` and in `comments`, add the comment:
+    "Your values are correct, so marks have been awarded accordingly. Please be more careful with your calculations next time."
+  - CALCULATION ERROR INSIDE A WORKING (correct inputs, wrong arithmetic):
+    When a student sets up a calculation with the correct inputs (e.g. `426,900 x 20%`) but writes a wrong result (e.g. 85,360 instead of 85,380), mark it the way the examiner does - the student loses ONE mark, at the working where the error happened:
+      * Award the marks for the correct inputs / method components of that line (e.g. the 426,900 base and the 20% share).
+      * Award 0 for the RESULT of that same working (e.g. the goodwill figure 18,460 that the working produces), even though it is the correct total of the student's own numbers. Reason: "18,460 results from a calculation error in this working (426,900 x 20% = 85,380, not 85,360). The correct figure is 18,480."
+      * Award own-figure (OF) marks in LATER, SEPARATE workings that carry the wrong figure forward (e.g. an NCI working that starts from 85,360). Do not penalise the same slip again there.
+
+• Scenario 3: If the student provides only the final answer without showing any values or calculations, and the answer is incorrect:
+  - Award 0 marks.
+  - In `breakdown[i].reason` and in `comments`, add the justification:
+    "No values or calculations have been shown, and the final answer is incorrect. Please show all values and calculations in your working next time."
+
+• Multi-component calculation lines (CRITICAL):
+  - When a calculation line has multiple components (e.g. `Less: Net assets at disposal (100,000 + 83,560 + (9/12 x 12,000))` where each component is 0.5 marks, or `PPE (1,226,500 + 409,500 + 16,300 - 9,780)`):
+    * Evaluate EACH component criterion INDIVIDUALLY against the student's answer.
+    * Award marks for every component value the student correctly included in their calculation/working.
+    * If the student shows the correct component values in their formula/working (e.g. 100,000, 83,560, 12,000 x 9/12, or 22,500 - 5,200) even if scaled by a percentage (such as x 75%) or split into separate sub-lines, the component values ARE present: award marks for those components and apply the Scenario 2 comment if the resulting line total differs: "Your values are correct, so marks have been awarded accordingly. Please be more careful with your calculations next time."
+    * PERCENTAGE-SCALED COMPONENTS: When a student incorporates a component by multiplying it by their ownership share (e.g. showing `(100,000 + 83,560 + 12,000 x 9/12) x 75%` or computing `9,000 x 75% = 6,750`):
+      The underlying component (Share capital 100,000, Reserves 83,560, Profit time-apportionment 12,000 x 9/12) HAS been demonstrated. You MUST award full marks for each of those component criteria. NEVER withhold marks on the grounds that "only the 75% share was shown" or "figure was multiplied by 75%".
+    * SEPARATE SUB-ITEMS FOR NET FIGURES: When a criterion specifies a net figure (e.g. "Goodwill at disposal = 17,300 (22,500 - 5,200)"), and the student shows both constituent parts clearly in their working (e.g. gross goodwill 22,500 and impairment 5,200):
+      The student HAS demonstrated the required treatment. You MUST award the marks. Do NOT withhold marks because the net total wasn't combined into a single line.
+    * If some components are correct and some are incorrect/missing, award marks ONLY for the correct components.
+    * If all component values are shown correctly but the arithmetic final result is wrong, apply Scenario 2: award full marks for all component criteria, withhold marks for the total/result, and add the Scenario 2 comment: "Your values are correct, so marks have been awarded accordingly. Please be more careful with your calculations next time."
+    * If the student shows only an incorrect final answer without the individual component values or working, apply Scenario 3: award 0 marks across all components and the final line, and add the Scenario 3 justification: "No values or calculations have been shown, and the final answer is incorrect. Please show all values and calculations in your working next time."
+
 • OF: see "Own figure" rule above — correct method with a wrong OF input from an earlier working → FULL marks.
+  - OWN FIGURE (OF) ENFORCEMENT ON TOTALS / BALANCES: If a criterion tests a total or carrying amount (such as NCI = 142,128), and the student's figure differs (e.g. 142,108) solely because they carried forward their own earlier intermediate figures/rounding with the correct method:
+    You MUST award FULL marks under the Own Figure rule. NEVER write "requires the correct total figure" to deny OF credit when the method is correct.
+
+• INTRA-GROUP ELIMINATION FIGURES (CRITICAL):
+  - When a criterion assesses eliminating an intra-group balance (e.g. intra-group receivables and payables):
+    * Award marks ONLY if the correct elimination figure is used in the student's calculation.
+    * If the student eliminates a WRONG figure (e.g. deducting 35,400 where 29,500 is required), award 0 for that elimination criterion. The separate criteria for adding the parent's and subsidiary's own figures still receive their marks.
+    * Reason/comment: "Please eliminate the correct intragroup balance of Rs. <correct> rather than Rs. <student figure>."
+
+• FIGURES GIVEN IN THE QUESTION MUST BE COPIED EXACTLY (CRITICAL):
+  - A criterion that tests a figure taken from the question (an opening balance, share capital, a year's profit, a cost) and has NO `of_source_ids` is not an own-figure criterion. If the student writes a different number - for example digits transposed (83,650 for 83,560) - award 0 for that criterion even when the rest of the working is right, and name the figure that should have been used.
+  - The same figure scaled by an ownership percentage (83,560 x 75%) still shows the figure: award it.
+
+• TIME-APPORTIONMENT:
+  - Award only when the student applies the period the criterion requires (e.g. ADDS 9/12 of the year's profit). Deducting the other part of the year or using a different fraction is a different calculation: award 0 and state the correct period.
+
+• EXAMINER GUIDANCE ON A CRITERION (CRITICAL):
+  - A criterion may carry an `examiner_guidance` field. It records how the examiner marks THAT criterion: alternative methods that are accepted, common wrong methods that score 0, and the comment to give. Follow it exactly - for that criterion it takes precedence over the general rules above.
+
+• PRESENTATION MARKS:
+  - A presentation criterion (e.g. "Presentation of the statement of financial position") is judged on the LAYOUT - the statement's headings and totals - not on its title. Award it even if the title is worded differently, misspelt, or appears after the statement in the extracted text.
+  - Evidence: quote the statement's TITLE line if there is one (e.g. "Consolidated Statement of Financial Position"), otherwise its first heading (e.g. "Non current assets") - never a date line or a figure line.
+
+
 
 Narrative / theory criteria (category = "narrative") — MEANING over wording:
 • Grade by MEANING. Synonyms, paraphrasing, alternative valid examples, and combined ideas earn the mark if the substance matches. Imperfect English / grammar / spelling → judge meaning, not language quality.
 • Rubric text after "e.g." or inside parentheses is ILLUSTRATIVE, not a required checklist.
 • If a tiered AWARD GUIDE exists ("2.0 / 1.5 / 1.0 / 0.5"), pick the tier the student's SUBSTANCE meets — do not down-tier for wording alone or for missing numbers (number-specific scoring lives in numeric criteria).
 • Down-tier ONLY when: (a) a required theme is missing, (b) the student contradicts the model answer, or (c) the point is too vague to identify the cause-effect link.
+
+═══════════════════════════════════════════════════
+DISTINCTION: NUMERICAL QUESTIONS VS THEORETICAL QUESTIONS (MANDATORY)
+═══════════════════════════════════════════════════
+
+1. NUMERICAL QUESTIONS / CALCULATION CRITERIA:
+• When evaluating numerical questions or calculation workings:
+  - Complete Response Evaluation: Evaluate the student's complete response — including theoretical explanations, statements, calculations, and numerical values.
+  - Calculations & Values: Check calculations and numerical values separately and award marks according to criteria.
+  - Accompanying Statements / Theory in Numerical Questions: If the student's accompanying statement or theoretical explanation is weak, imperfect, or does not fully convey the intended meaning, do NOT deduct marks from the valid calculations or correct numerical values! Award the calculation marks and provide constructive feedback.
+  - Example constructive comment for numerical questions: "Your calculations and values are correct, but your theoretical explanation and statement do not fully convey the intended meaning. Please read the question carefully and be more accurate and careful when writing your theoretical statements next time."
+
+2. THEORETICAL QUESTIONS / NARRATIVE CRITERIA (category = "narrative"):
+• CRITICAL: The non-deduction rule above applies ONLY to numerical questions and calculations — it does NOT apply to theoretical questions or pure narrative criteria!
+• In theoretical questions and narrative criteria, marks are awarded ONLY if the context, substance, and meaning match the model answer / accounting principle.
+• Student's Own Wording: The student is NOT required to reproduce the model answer word-for-word. Synonyms, paraphrasing, and student's own wording are fully acceptable, BUT the context, accounting concept, and underlying meaning MUST strictly match.
+• Incorrect or Incomplete Theory: If the student's theoretical explanation or statement is incorrect, contradicts the accounting principle, fails to convey the required concept, or if the context and meaning do not match, marks MUST NOT be awarded (award 0 marks, or proportional partial marks only if a specific sub-component of the concept is correctly stated).
+• Constructive Feedback: In such cases, identify the issue clearly in the feedback and guide the student on how to improve their theoretical understanding.
 
 ═══════════════════════════════════════════════════
 EVIDENCE RULES
@@ -488,8 +561,14 @@ WHEN TO EMIT A COMMENT — only if BOTH conditions hold:
 
 Concretely, emit a comment ONLY for:
 • Every OF award — quote the student's line (their OF value in context) and tell them the correct figure. Example (real teacher note on an OF-marked Dr NCI 4,700): "[1] Dr NCI 4,700,000 → OF marks awarded for using your own figure. Please consider using the carrying amount of the non-controlling interest at disposal (£6.975 million)."
+• Scenario 2 (Values correct, calculation error): quote the student's calculation/total line and emit:
+  "[<sub-question>] <5-10 word quote of calculation/total line> → Your values are correct, so marks have been awarded accordingly. Please be more careful with your calculations next time."
+• Scenario 3 (Final answer only without values/calculations, incorrect): quote the student's bare answer and emit:
+  "[<sub-question>] <5-10 word quote of final answer> → No values or calculations have been shown, and the final answer is incorrect. Please show all values and calculations in your working next time."
 • A student line that received PARTIAL credit and where the wrong element is fixable with one specific correction — quote the line, say what's wrong, name the correct figure or method. Do NOT emit a partial-credit comment when the reason is just "one of several components missing"; only when the STUDENT'S WRITING itself contains a specific fixable error.
 • A student line that got 0 because the student wrote it INCORRECTLY (wrong direction on a journal, wrong method) — quote the wrong line and give the fix. Do NOT emit when the criterion scored 0 because the student did not write anything for it.
+• Theory / Statement issues with correct calculations: quote the student's theoretical statement and emit:
+  "[<sub-question>] <5-10 word quote of statement> → Your calculations and values are correct, but your theoretical explanation and statement do not fully convey the intended meaning. Please read the question carefully and be more accurate and careful when writing your theoretical statements next time."
 
 DO NOT EMIT A COMMENT FOR:
 • Fully-correct criteria (marks_awarded == max_possible AND no OF flag). The tick is enough.
@@ -1163,18 +1242,20 @@ same point again here". The usual shapes:
     the marks.
   • A conclusion restated in a summary after the work was done.
 
+CRITICAL - STRICT FILTERING (DO NOT CLUTTER THE SCRIPT):
 Do NOT flag a line when:
-  • It is a DIFFERENT step that happens to use the same number. A working that
-    produces a figure and a journal that posts it are two different pieces of
-    work, each with its own marks - not one point made twice.
-  • It merely contains a similar number with no connection to the credited point.
-  • It is simply wrong, or an attempt that earned nothing anywhere. A line that
-    was never credited at all gets no pointer - there is nothing to point to.
+  • It is a BARE NUMBER, currency figure, calculation line, or table cell (e.g. "1,642,520.00", "-", "(5,200.00)", "800,000.00").
+    In real exams, markers NEVER write "Marks given above/below" on financial statement table rows or bare numbers.
+  • It is a row inside a standard balance sheet / financial statement (Statement of Financial Position, P&L, etc.).
+  • It is a DIFFERENT step that happens to use the same number (e.g., a journal entry vs a calculation).
+  • It is an incomplete sentence fragment or isolated symbol (like "-", "for", "etc.").
+  • It is simply wrong, or an attempt that earned nothing anywhere.
 
-Match on the POINT, not on the digits. Work through the whole list rather than
-stopping at the first few; a long script usually has ten to fifteen of these,
-and returning only one or two means the list was skimmed. Where you genuinely
-cannot tell, leave it out.
+BE EXTREMELY SELECTIVE:
+Only flag when there is an explicit, full narrative sentence or labeled heading where the student clearly summarizes or states a result that was calculated and credited elsewhere (e.g. "Goodwill on acquisition (W1): 18,460").
+Most scripts have only 0 to 2 such notes across the entire question. If none meet this standard, return an empty list:
+{{"restatements": []}}
+
 
 ═══════════════════════════════════════════════════
 OUTPUT FORMAT - return ONLY valid JSON, nothing else

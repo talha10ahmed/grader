@@ -97,6 +97,7 @@ def _build_chat_model(provider: str, model: str, temperature: float = 0):
             model=model,
             api_key=openai_api,  # type: ignore[arg-type]
             temperature=temperature,
+            seed=42,
         )
     if provider in ["anthropic", "claude"]:
         return ChatAnthropic(  # type: ignore[call-arg]
